@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+.DS_Store
+.spotipy/
+.streamlit/secrets.toml
+
+# Participant experiment data (privacy)
+logs/*.json
+logs/*.jsonl
+logs/*.log
+logs/archive/
+
+# Spotify token cache
+.cache
+.cache-*

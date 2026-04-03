@@ -1,0 +1,41 @@
+# tensorflow==2.15.1  # Désactivé: installez selon votre plateforme.
+# Pour Apple Silicon:
+#   pip uninstall -y tensorflow
+#   pip install --upgrade pip
+#   pip install tensorflow-macos==2.15.0 tensorflow-metal==1.1.0
+# Activez ensuite DeepFace avec: export F2M_ENABLE_DEEPFACE=1
+# keras==2.15.0  # (supprimé — intégré dans tensorflow)
+protobuf==4.23.4
+deepface==0.0.93
+retina-face==0.0.15
+streamlit>=1.35.0  # >=1.35 inclut des corrections de shutdown event loop
+spotipy>=2.19.0  # Pour interagir avec l'API Spotify
+requests>=2.25.1  # Pour les requêtes HTTP (si utilisé)
+pandas>=1.3.0  # Pour la manipulation des données (si utilisé)
+numpy>=1.21.0,<2.0.0  # verrou pour compat DeepFace
+python-dotenv>=1.0.0
+watchdog>=4.0.0  # Optionnel: améliore le rechargement Streamlit local
+urllib3<2.0.0  # Optionnel: supprimer l'avertissement LibreSSL (ou mettre à jour Python/OpenSSL)
+opencv-python>=4.8.0  # Utiliser version non headless pour accès caméra local (headless pour déploiement serveur)
+Pillow>=10.0.0
+transformers>=4.44
+torch       # (CPU suffit)
+safetensors
+accelerate
+
+# Ajouter si Apple Silicon (optionnel, à la place de tensorflow ci-dessus):
+# tensorflow-macos==2.15.0
+# tensorflow-metal==1.1.0
+# NOTE: Ne pas committer de vrais identifiants dans .env
+
+# NOTE (Apple Silicon): si erreur libmetal_plugin / _pywrap_tensorflow_internal,
+# désinstaller 'tensorflow' puis installer:
+#   pip install --upgrade pip
+#   pip install tensorflow-macos==2.15.0 tensorflow-metal==1.1.0
+
+# Apple Silicon (recommandé pour DeepFace):
+#   pip uninstall -y tensorflow keras tf-keras tensorflow-metal tensorflow-macos
+#   pip install --upgrade pip
+#   pip install tensorflow-macos==2.15.0 tensorflow-metal==1.1.0
+# Si vous restez sur TF>=2.17: installez tf-keras
+#   pip install tf-keras
