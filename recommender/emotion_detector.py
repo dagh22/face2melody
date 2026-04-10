@@ -25,6 +25,12 @@ _STATUS = (
 
 # DeepFace est importé à la demande pour éviter les délais à l'import
 def _import_deepface():
+    # Pré-initialise tensorflow.keras pour éviter les erreurs d'import de mtcnn
+    try:
+        import tensorflow as _tf  # noqa: F401
+        import tensorflow.keras  # noqa: F401
+    except Exception:
+        pass
     from deepface import DeepFace  # type: ignore
 
     return DeepFace

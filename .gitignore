@@ -18,3 +18,7 @@ logs/archive/
 # Spotify token cache
 .cache
 .cache-*
+
+# Editor & Claude Code internals
+.claude/
+.vscode/

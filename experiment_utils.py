@@ -13,6 +13,7 @@ from emotion_detection.text_utils import emotion_distribution
 
 __all__ = [
     "fuse",
+    "_fuse_heuristic",
     "build_user_profile",
     "get_personal_seeds",
     "recommend_for_emotion",
@@ -89,8 +90,8 @@ def normalize_probs(p: Dict[str, float]) -> Dict[str, float]:
     return {k: v / s for k, v in out.items()}
 
 
-def fuse(face_probs: Dict[str, float], text_probs: Dict[str, float], w_face=0.4):
-    """Fusion pondérée visage/texte → (distribution, label)"""
+def _fuse_heuristic(face_probs: Dict[str, float], text_probs: Dict[str, float], w_face=0.4):
+    """Fusion pondérée visage/texte V1 — préservée comme fallback pour l'agent V2."""
     wf = float(max(0.0, min(1.0, w_face)))
     fp = normalize_probs(face_probs)
     tp = normalize_probs(text_probs)
@@ -98,6 +99,44 @@ def fuse(face_probs: Dict[str, float], text_probs: Dict[str, float], w_face=0.4)
     s = sum(fused.values()) or 1.0
     fused = {k: v / s for k, v in fused.items()}
     return fused, max(fused, key=fused.get)
+
+
+def fuse(
+    face_probs: Dict[str, float],
+    text_probs: Dict[str, float],
+    w_face: float = 0.4,
+    text_raw: Optional[str] = None,
+) -> Tuple[Dict[str, float], str]:
+    """
+    V2 : délègue à EmotionFusionAgent (LLM Claude).
+    Retombe sur _fuse_heuristic() si l'agent est indisponible.
+    Stocke l'AgentResult dans st.session_state['agent_result'] pour l'affichage XAI.
+    Retourne (fused_distribution, dominant_emotion) pour rétrocompatibilité.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    try:
+        from agent_logic import get_agent
+        result = get_agent().analyze(
+            face_probs, text_probs, text_raw=text_raw, w_face=w_face
+        )
+    except Exception as exc:
+        _log.warning("agent_logic indisponible (%s), fallback V1.", exc)
+        from agent_logic import AgentResult, _ANCHOR
+        fd, dom = _fuse_heuristic(face_probs, text_probs, w_face)
+        v, a = _ANCHOR.get(dom, (0.55, 0.50))
+        result = AgentResult(
+            valence=v, arousal=a,
+            dominant_emotion=dom,
+            fused_distribution=fd,
+            reasoning=f"[V1 fallback] Émotion dominante : {dom}.",
+            from_fallback=True,
+        )
+    try:
+        st.session_state["agent_result"] = result
+    except Exception:
+        pass
+    return result.fused_distribution, result.dominant_emotion
 
 
 # -----------------------

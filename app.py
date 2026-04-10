@@ -9,7 +9,7 @@ os.environ.setdefault("GLOG_minloglevel", "4")
 os.environ.setdefault("GLOG_logtostderr", "1")
 os.environ.setdefault("ABSL_LOG_SEVERITY", "error")
 
-# --- Mitigation arrêt propre: fermer l'event loop asyncio à la sortie ---
+# --- Arrêt propre de la boucle asyncio ---
 import atexit, asyncio
 def _close_asyncio_loop():
     try:
@@ -26,107 +26,38 @@ def _close_asyncio_loop():
         pass
 atexit.register(_close_asyncio_loop)
 
-import unicodedata
-import time, logging, contextlib, sys
-from typing import Dict, List
+import keras  # noqa: F401 — doit précéder tout import DeepFace/mtcnn pour enregistrer tensorflow.keras
+import time, logging, contextlib, sys, threading, urllib.parse
+from typing import Dict, List, Optional
 from collections import deque
 
 import streamlit as st
 import random
-# IMPORTANT: Streamlit exige que set_page_config() soit le tout premier appel Streamlit
-# (avant tout st.sidebar / st.write / etc.).
-st.set_page_config(page_title="Face2Melody", page_icon="🎵", layout="wide")
+
+# IMPORTANT : set_page_config doit être le tout premier appel Streamlit
+st.set_page_config(
+    page_title="Face2Melody V3",
+    page_icon="🎵",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 from spotipy import Spotify, SpotifyException
 logger = logging.getLogger(__name__)
 from feedback_learning import load_feedback_stats, rerank_tracks_with_feedback
+
 def get_log_path(pid: str) -> str:
     return f"logs/experiment_{pid}.jsonl"
+
 from recommender.emotion_detector import get_status, get_backend, is_ready
 from emotion_detection.text_utils import detect_emotion_from_text, emotion_distribution
-
-# ✅ Sidebar seulement après set_page_config
-with st.sidebar:
-    st.caption(f"Détection: {get_status()} | backend={get_backend()} | ready={is_ready()}")
-def get_audio_features_for_uri(sp: Spotify, uri: str) -> dict:
-    """
-    Récupère valence/energy pour un URI de track Spotify.
-    Ne lève jamais d'exception : en cas d'erreur -> {}.
-    """
-    if not sp or not uri:
-        return {}
-
-    try:
-        track_id = uri.split(":")[-1]
-        feats_list = sp.audio_features([track_id])
-        if not feats_list or feats_list[0] is None:
-            logger.warning("Aucune audio_feature trouvée pour %s", track_id)
-            return {}
-
-        f = feats_list[0]
-        return {
-            "valence": f.get("valence"),
-            "energy": f.get("energy"),
-            "tempo": f.get("tempo"),
-        }
-    except SpotifyException as e:
-        logger.warning("Spotify  audio_features %s -> %s", uri, e)
-        return {}
-    except Exception as e:
-        logger.warning("Erreur inconnue audio_features %s -> %s", uri, e)
-        return {}
-@contextlib.contextmanager
-def _silence_native():
-    if os.getenv("F2M_SILENCE_NATIVE", "1") != "1":
-        yield
-        return
-    try:
-        fd = sys.stderr.fileno()
-    except Exception:
-        old = sys.stderr
-        try:
-            import io
-            sys.stderr = io.StringIO()
-            yield
-        finally:
-            sys.stderr = old
-        return
-    saved = os.dup(fd)
-    try:
-        dn = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(dn, fd)
-        os.close(dn)
-        yield
-    finally:
-        os.dup2(saved, fd)
-        os.close(saved)
-
-def _rerun():
-    try:
-        import streamlit as _st
-        if hasattr(_st, "rerun"):
-            _st.rerun()
-        else:
-            _st.experimental_rerun()
-    except Exception:
-        pass
-
-def normalize_redirect_uri():
-    cur = os.getenv("SPOTIPY_REDIRECT_URI") or ""
-    if ":8503/callback" in cur or "//localhost:8503/callback" in cur:
-        fixed = "http://127.0.0.1:8888/callback"
-        os.environ["SPOTIPY_REDIRECT_URI"] = fixed
-        try:
-            st.sidebar.info(f"Redirect URI ajustée vers {fixed}. Ajoutez-la aussi dans le Dashboard Spotify.")
-        except Exception:
-            pass
 
 try:
     from dotenv import load_dotenv
     load_dotenv(override=True)
     if not os.getenv("SPOTIPY_CLIENT_ID") or not os.getenv("SPOTIPY_REDIRECT_URI"):
-        raise RuntimeError("Les variables SPOTIPY_CLIENT_ID et SPOTIPY_REDIRECT_URI ne sont pas définies ou accessibles.")
-except:
+        raise RuntimeError("Variables SPOTIPY_CLIENT_ID / SPOTIPY_REDIRECT_URI manquantes.")
+except Exception:
     pass
 
 logging.getLogger("spotipy.client").setLevel(logging.ERROR)
@@ -141,88 +72,311 @@ try:
 except Exception:
     pass
 
-from recommender.emotion_detector import (
-    analyze_emotion,
-    is_ready,
-    get_status,
-    reload_deepface,
-)
-
-with _silence_native():
-    pass
-
-from spotipy import SpotifyException
+from recommender.emotion_detector import analyze_emotion, is_ready, get_status, reload_deepface
 from PIL import Image
-
 from recommender.spotify_interface import SpotifyInterface
+from recommender.lastfm_interface import LastFMInterface, lastfm_available
 from experiment_utils import (
-    fuse,
-    build_user_profile,
-    recommend_for_emotion,
-    append_log_line,
-    audio_features_by_uri,
-    now_iso,
-    set_sp_global,
-    set_cache_salt,
+    fuse, build_user_profile, recommend_for_emotion, append_log_line,
+    audio_features_by_uri, now_iso, set_sp_global, set_cache_salt,
 )
-from emotion_detection.text_utils import detect_emotion_from_text
 
 try:
     from absl import logging as absl_logging
     absl_logging.set_verbosity("error")
-except:
+except Exception:
     pass
 
-status = get_status()
 SHOW_DEEPFACE_UI = False
 try:
     from analytics_gen import render as analytics_render
 except Exception:
     analytics_render = None
 
-with st.sidebar:
-    view = st.radio("Vue", ["Expérience", "Analytics"], index=0, key="view_mode")
+# ──────────────────────────────────────────────────────────────────────────────
+# Constantes & détection
+# ──────────────────────────────────────────────────────────────────────────────
 
-if st.session_state.get("view_mode") == "Analytics":
-    if analytics_render:
-        try:
-            analytics_render()
-        except Exception as e:
-            st.error("Erreur dans la page Analytics.")
-            st.exception(e)
-    else:
-        st.error("Module analytics_gen introuvable. Lancez `streamlit run analytics_gen.py` pour l'utiliser en autonome.")
-    st.stop()
+_FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+FRAME_INTERVAL_DEEPFACE = 1
 
-if SHOW_DEEPFACE_UI:
-    if status.get("disabled_reason"):
-        st.warning(status["disabled_reason"])
-        if st.button("Activer DeepFace maintenant"):
-            reload_deepface(force_enable=True)
-            _rerun()
-    elif not status.get("ok"):
-        err = status.get("error") or "Import DeepFace impossible."
-        if st.button("Réessayer DeepFace"):
-            reload_deepface()
-            _rerun()
-        st.warning(f"DeepFace indisponible (heuristique). {err}")
-if SHOW_DEEPFACE_UI:
-    st.info(f"Statut DeepFace: {get_status()}")
-    if st.button("Réessayer DeepFace"):
-        reload_deepface()
-        _rerun()
+DEFAULT_TARGETS = {
+    "happy":   {"val": 0.85, "eng": 0.75},
+    "sad":     {"val": 0.20, "eng": 0.35},
+    "angry":   {"val": 0.30, "eng": 0.90},
+    "neutral": {"val": 0.55, "eng": 0.50},
+}
+LABEL_SAFE_GENRES = {
+    "happy":   ["dance", "pop", "electronic"],
+    "sad":     ["indie", "chill", "pop"],
+    "angry":   ["rock", "electronic", "indie"],
+    "neutral": ["pop", "indie", "dance"],
+}
+REQUIRED_SCOPES = [
+    "user-top-read",
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "user-library-read",
+]
+SCOPE = " ".join(REQUIRED_SCOPES)
 
-import cv2 as _cv_check
-if "headless" in (_cv_check.getBuildInformation() or "").lower():
-    st.info("OpenCV headless détecté: installez opencv-python pour la capture caméra locale (sinon crash possible).")
+# ──────────────────────────────────────────────────────────────────────────────
+# Injection CSS — thème sombre professionnel
+# ──────────────────────────────────────────────────────────────────────────────
 
-MEASURE_SECONDS = 15.0
-FRAME_INTERVAL_DEEPFACE = 1  # ← augmenté
-MIN_VALID_FRAMES = 10
-_FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-_SMILE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+_FONTS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+"""
 
-# --- Remap 7 émotions DeepFace -> 4 classes projet ---
+_CSS = """
+<style>
+/* ══ Cyber Violet — Face2Melody V3 Design System ══════════════════════════ */
+
+/* Variables */
+:root {
+    --bg-primary:    #07071a;
+    --bg-card:       rgba(139, 92, 246, 0.06);
+    --accent-purple: #8b5cf6;
+    --accent-cyan:   #06b6d4;
+    --accent-gold:   #f59e0b;
+    --glow-purple:   rgba(139, 92, 246, 0.35);
+    --glow-cyan:     rgba(6, 182, 212, 0.35);
+    --text-muted:    #94a3b8;
+    --emotion-happy:   #f59e0b;
+    --emotion-sad:     #3b82f6;
+    --emotion-angry:   #ef4444;
+    --emotion-neutral: #10b981;
+}
+
+/* Animations */
+@keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 8px var(--glow-purple), 0 0 16px var(--glow-purple); }
+    50%       { box-shadow: 0 0 20px var(--glow-cyan),  0 0 40px var(--glow-cyan); }
+}
+@keyframes waveform {
+    0%, 100% { transform: scaleY(0.4); opacity: 0.6; }
+    50%       { transform: scaleY(1.0); opacity: 1.0; }
+}
+@keyframes heartbeat {
+    0%, 100% { transform: scale(1.0); }
+    14%       { transform: scale(1.15); }
+    28%       { transform: scale(1.0); }
+    42%       { transform: scale(1.12); }
+}
+@keyframes scan-line {
+    0%   { top: 0%; opacity: 0.4; }
+    100% { top: 100%; opacity: 0; }
+}
+
+/* ── Titre principal ──────────────────────────────────────────────────────── */
+.f2m-title {
+    font-family: 'Orbitron', 'Arial Black', sans-serif;
+    font-size: 2.6rem;
+    font-weight: 900;
+    background: linear-gradient(135deg, #a78bfa 0%, #06b6d4 60%, #8b5cf6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.1;
+    margin-bottom: 0.15rem;
+    letter-spacing: 0.06em;
+    text-shadow: none;
+    filter: drop-shadow(0 0 18px rgba(139,92,246,0.5));
+}
+.f2m-subtitle {
+    font-family: 'Inter', sans-serif;
+    color: #64748b;
+    font-size: 0.82rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 1.2rem;
+}
+
+/* ── Cards chat messages ─────────────────────────────────────────────────── */
+.chat-card-assistant {
+    background: var(--bg-card);
+    border: 1px solid rgba(139, 92, 246, 0.25);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    margin: 0.4rem 0;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4), 0 0 0 1px rgba(139,92,246,0.1);
+}
+
+/* ── Badge émotion ───────────────────────────────────────────────────────── */
+.emotion-badge {
+    display: inline-block;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    padding: 4px 14px;
+    border-radius: 20px;
+    border: 2px solid var(--accent-purple);
+    color: var(--accent-purple);
+    background: rgba(139,92,246,0.1);
+    animation: pulse-glow 2.5s ease-in-out infinite;
+    margin-top: 6px;
+}
+.emotion-badge-happy   { border-color: var(--emotion-happy);   color: var(--emotion-happy);   background: rgba(245,158,11,0.1); }
+.emotion-badge-sad     { border-color: var(--emotion-sad);     color: var(--emotion-sad);     background: rgba(59,130,246,0.1); }
+.emotion-badge-angry   { border-color: var(--emotion-angry);   color: var(--emotion-angry);   background: rgba(239,68,68,0.1); }
+.emotion-badge-neutral { border-color: var(--emotion-neutral); color: var(--emotion-neutral); background: rgba(16,185,129,0.1); }
+
+/* ── Waveform BPM ────────────────────────────────────────────────────────── */
+.bpm-waveform {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 24px;
+    margin: 4px 0;
+}
+.bpm-bar {
+    width: 3px;
+    border-radius: 2px;
+    background: var(--accent-cyan);
+    animation: waveform 0.8s ease-in-out infinite;
+}
+.bpm-bar:nth-child(1) { animation-delay: 0.0s; height: 60%; }
+.bpm-bar:nth-child(2) { animation-delay: 0.1s; height: 100%; }
+.bpm-bar:nth-child(3) { animation-delay: 0.2s; height: 45%; }
+.bpm-bar:nth-child(4) { animation-delay: 0.3s; height: 80%; }
+.bpm-bar:nth-child(5) { animation-delay: 0.4s; height: 35%; }
+.bpm-bar:nth-child(6) { animation-delay: 0.15s; height: 90%; }
+.bpm-bar:nth-child(7) { animation-delay: 0.25s; height: 55%; }
+
+/* ── Carte XAI ───────────────────────────────────────────────────────────── */
+.xai-card {
+    background: rgba(6, 182, 212, 0.04);
+    border-left: 3px solid var(--accent-cyan);
+    border-radius: 0 8px 8px 0;
+    padding: 0.75rem 1rem;
+    margin-top: 0.5rem;
+    font-size: 0.86rem;
+    color: #cbd5e1;
+    font-family: 'Inter', sans-serif;
+    position: relative;
+    overflow: hidden;
+}
+.xai-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent-cyan), transparent);
+}
+
+/* ── Badge plateforme ────────────────────────────────────────────────────── */
+.platform-badge {
+    display: inline-block;
+    font-family: 'Orbitron', monospace;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    padding: 3px 14px;
+    border-radius: 20px;
+    border: 1px solid rgba(139,92,246,0.5);
+    background: rgba(139,92,246,0.12);
+    color: #a78bfa;
+    text-transform: uppercase;
+}
+.platform-badge-lastfm  { border-color: #d32f2f; background: rgba(211,47,47,0.12); color: #ef5350; }
+.platform-badge-youtube { border-color: #c62828; background: rgba(198,40,40,0.10); color: #ef5350; }
+.platform-badge-apple   { border-color: #ad1457; background: rgba(173,20,87,0.10); color: #f48fb1; }
+
+/* ── Carte track Last.fm ─────────────────────────────────────────────────── */
+.lastfm-track-card {
+    background: rgba(139,92,246,0.05);
+    border: 1px solid rgba(139,92,246,0.18);
+    border-radius: 10px;
+    padding: 0.65rem 0.9rem;
+    margin: 0.3rem 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: border-color 0.2s;
+}
+.lastfm-track-card:hover {
+    border-color: rgba(139,92,246,0.5);
+}
+
+/* ── Camera container ────────────────────────────────────────────────────── */
+.camera-container {
+    position: relative;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 2px solid rgba(139,92,246,0.4);
+    box-shadow: 0 0 20px rgba(139,92,246,0.2);
+}
+.camera-scan {
+    position: absolute;
+    width: 100%;
+    height: 3px;
+    background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+    animation: scan-line 2.5s linear infinite;
+    pointer-events: none;
+}
+
+/* ── Sidebar header ──────────────────────────────────────────────────────── */
+.sidebar-logo {
+    font-family: 'Orbitron', monospace;
+    font-size: 1.3rem;
+    font-weight: 900;
+    background: linear-gradient(135deg, #a78bfa, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: 0.06em;
+    filter: drop-shadow(0 0 10px rgba(139,92,246,0.6));
+}
+.sidebar-subtitle {
+    color: #475569;
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+/* ── Métriques header ────────────────────────────────────────────────────── */
+.metric-cyber {
+    background: rgba(139,92,246,0.06);
+    border: 1px solid rgba(139,92,246,0.2);
+    border-radius: 10px;
+    padding: 0.6rem 0.8rem;
+    text-align: center;
+}
+.metric-cyber .value {
+    font-family: 'Orbitron', monospace;
+    font-size: 1.2rem;
+    color: var(--accent-cyan);
+    font-weight: 700;
+}
+.metric-cyber .label {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+/* ── Player card (embedded players) ─────────────────────────────────────── */
+.player-card {
+    background: rgba(139, 92, 246, 0.05);
+    border: 1px solid rgba(139, 92, 246, 0.25);
+    border-radius: 12px;
+    padding: 10px;
+    margin: 6px 0;
+    backdrop-filter: blur(8px);
+    overflow: hidden;
+}
+</style>
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Remapping 7 émotions DeepFace → 4 classes projet
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _map7to4(em: dict) -> Dict[str, float]:
     a = float(em.get("angry", 0.0))
     d = float(em.get("disgust", 0.0))
@@ -231,37 +385,209 @@ def _map7to4(em: dict) -> Dict[str, float]:
     s = float(em.get("sad", 0.0))
     u = float(em.get("surprise", 0.0))
     n = float(em.get("neutral", 0.0))
-    mapped = {
-        "angry": a + d + f,
-        "happy": h,
-        "sad": s,
-        "neutral": n + 0.5 * u,
-    }
+    mapped = {"angry": a + d + f, "happy": h, "sad": s, "neutral": n + 0.5 * u}
     tot = sum(mapped.values()) or 0.0
     if tot > 0:
         mapped = {k: v / tot for k, v in mapped.items()}
     return mapped
 
-# State init
-for k, v in {"features_cache": {}, "af_fail": set(), "spotify_ready": False}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-st.session_state.setdefault("af_cache_by_id", {})
-st.session_state.setdefault("af_fail_ids", set())
-if "emotion_history" not in st.session_state:
-    st.session_state["emotion_history"] = {}
-if "disliked_uris" not in st.session_state:
-    st.session_state["disliked_uris"] = set()
-st.session_state.setdefault("api_err", set())
-st.session_state.setdefault("block_spotify_features", False)
+# ──────────────────────────────────────────────────────────────────────────────
+# Fil caméra — module-level (non bloquant pour le chat)
+# ──────────────────────────────────────────────────────────────────────────────
 
-REQUIRED_SCOPES = [
-    "user-top-read",
-    "playlist-modify-private",
-    "playlist-modify-public",
-    "user-library-read",
-]
-SCOPE = " ".join(REQUIRED_SCOPES)
+_EMA_EMOTIONS = ("neutral", "happy", "sad", "angry")
+
+_CAM_STATE: Dict = {
+    "running":    False,
+    "thread":     None,
+    "frame_rgb":  None,
+    "probs":      {"neutral": 1.0},
+    "probs_ema":  {"neutral": 1.0, "happy": 0.0, "sad": 0.0, "angry": 0.0},
+    "label":      "neutral",
+    "faces_seen": False,
+    "frame_count": 0,
+}
+_CAM_LOCK = threading.Lock()
+_cam_stop_event: threading.Event = threading.Event()
+
+
+def _camera_worker(stop_event: threading.Event) -> None:
+    """Fil caméra : capture en continu, analyse DeepFace, stocke dans _CAM_STATE."""
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        with _CAM_LOCK:
+            _CAM_STATE["running"] = False
+        return
+
+    frame_count = 0
+    try:
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_count += 1
+
+            faces = _FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(70, 70))
+            probs: Dict[str, float] = {}
+            label = "neutral"
+
+            if len(faces) > 0:
+                x, y, w, h = faces[0]
+                face_bgr = frame[y:y+h, x:x+w]
+
+                # Pré-traitement image
+                try:
+                    if w >= 80 and h >= 80:
+                        face_bgr = cv2.resize(face_bgr, (256, 256), interpolation=cv2.INTER_LINEAR)
+                    gmean = float(cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY).mean())
+                    gamma = 1.0 if 90 <= gmean <= 160 else (1.15 if gmean < 90 else 0.9)
+                    table = ((np.arange(256) / 255.0) ** (1.0 / gamma) * 255.0).astype("uint8")
+                    face_bgr = cv2.LUT(face_bgr, table)
+                except Exception:
+                    pass
+
+                # Analyse DeepFace (si disponible)
+                if frame_count % FRAME_INTERVAL_DEEPFACE == 0 and is_ready():
+                    try:
+                        res = analyze_emotion(face_bgr, detector_backend="skip", enforce_detection=False)
+                        if isinstance(res, list) and res:
+                            res = res[0]
+                        em = (res or {}).get("emotion") or {}
+                        s = float(sum(em.values()) or 0.0)
+                        if s > 0:
+                            probs = _map7to4(em)
+                    except Exception:
+                        pass
+
+                # Fallback heuristique si DeepFace n'a rien retourné
+                if not probs:
+                    roi_gray = gray[y:y+h, x:x+w]
+                    mean = float(roi_gray.mean())
+                    std  = float(roi_gray.std())
+                    val  = max(0.0, min(1.0, (mean - 60.0) / 120.0))
+                    eng  = max(0.0, min(1.0, (std  - 20.0) / 80.0))
+                    if val > 0.65 and eng > 0.35:
+                        probs = {"happy": 0.7, "neutral": 0.3}
+                    elif val < 0.35 and eng < 0.40:
+                        probs = {"sad": 0.6, "neutral": 0.4}
+                    else:
+                        probs = {"neutral": 1.0}
+
+                label = max(probs, key=probs.get)
+
+                # Overlay visuel
+                cv2.rectangle(rgb, (x, y), (x + w, y + h), (100, 255, 150), 2)
+                cv2.putText(rgb, label, (x, max(0, y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 150), 2)
+                try:
+                    tops = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:2]
+                    cv2.putText(rgb, " | ".join(f"{k}:{v:.2f}" for k, v in tops),
+                                (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                except Exception:
+                    pass
+
+            with _CAM_LOCK:
+                _CAM_STATE["frame_rgb"]   = rgb
+                _CAM_STATE["frame_count"] = frame_count
+                ema = _CAM_STATE["probs_ema"]
+                if probs:
+                    # EMA — α=0.4 vers la nouvelle observation
+                    for k in _EMA_EMOTIONS:
+                        ema[k] = 0.4 * probs.get(k, 0.0) + 0.6 * ema[k]
+                    _CAM_STATE["probs"]      = probs
+                    _CAM_STATE["faces_seen"] = True
+                else:
+                    # Pas de visage → déclin progressif vers neutre
+                    for k in _EMA_EMOTIONS:
+                        target = 1.0 if k == "neutral" else 0.0
+                        ema[k] = 0.15 * target + 0.85 * ema[k]
+                # Normalisation (évite la dérive flottante sur sessions longues)
+                ema_sum = sum(ema.values()) or 1.0
+                for k in _EMA_EMOTIONS:
+                    ema[k] /= ema_sum
+                # Label dérivé de l'EMA (transitions douces)
+                _CAM_STATE["label"] = max(ema, key=ema.get)
+
+            time.sleep(0.04)  # ~25 fps
+    finally:
+        cap.release()
+        with _CAM_LOCK:
+            _CAM_STATE["running"] = False
+
+
+def start_camera() -> None:
+    """Démarre le fil caméra en arrière-plan."""
+    global _cam_stop_event
+    with _CAM_LOCK:
+        if _CAM_STATE["running"]:
+            return
+    _cam_stop_event = threading.Event()
+    t = threading.Thread(target=_camera_worker, args=(_cam_stop_event,), daemon=True)
+    t.start()
+    with _CAM_LOCK:
+        _CAM_STATE["running"] = True
+        _CAM_STATE["thread"]  = t
+
+
+def stop_camera() -> None:
+    """Arrête le fil caméra."""
+    _cam_stop_event.set()
+    with _CAM_LOCK:
+        _CAM_STATE["running"] = False
+        _CAM_STATE["thread"]  = None
+        _CAM_STATE["frame_rgb"] = None
+
+
+def get_face_probs() -> Dict[str, float]:
+    """Retourne la dernière distribution d'émotions faciales capturée."""
+    with _CAM_LOCK:
+        return dict(_CAM_STATE["probs"])
+
+
+def get_camera_status_v3() -> str:
+    """
+    Dérive le statut qualitatif de la caméra pour le poids dynamique V3.
+    Utilisé par process_multimodal_emotions(camera_status=...).
+    """
+    with _CAM_LOCK:
+        if not _CAM_STATE["running"] or not _CAM_STATE["faces_seen"]:
+            return "unavailable"
+        max_conf = max(_CAM_STATE["probs"].values(), default=0.0)
+        if max_conf < 0.35:
+            return "low_light"
+        return "ok"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gestion session state
+# ──────────────────────────────────────────────────────────────────────────────
+
+for _k, _v in {
+    "features_cache": {},
+    "af_fail": set(),
+    "spotify_ready": False,
+    "af_cache_by_id": {},
+    "af_fail_ids": set(),
+    "emotion_history": {},
+    "disliked_uris": set(),
+    "api_err": set(),
+    "block_spotify_features": False,
+}.items():
+    st.session_state.setdefault(_k, _v)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Spotify helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def normalize_redirect_uri():
+    cur = os.getenv("SPOTIPY_REDIRECT_URI") or ""
+    if ":8503/callback" in cur or "//localhost:8503/callback" in cur:
+        fixed = "http://127.0.0.1:8888/callback"
+        os.environ["SPOTIPY_REDIRECT_URI"] = fixed
 
 def get_sp_client(pid: str) -> SpotifyInterface:
     return SpotifyInterface(
@@ -271,55 +597,43 @@ def get_sp_client(pid: str) -> SpotifyInterface:
         show_dialog=True,
     )
 
-# --- Feedback learning (stats) ---
-# On recharge les stats uniquement si le Participant ID change.
-_pid_fb = (st.session_state.get("pid") or "").strip()
-if _pid_fb:
-    if st.session_state.get("_fb_pid") != _pid_fb:
-        _log_path = f"logs/experiment_{_pid_fb}.jsonl"
-        st.session_state["fb_stats"] = load_feedback_stats(_log_path)
-        st.session_state["_fb_pid"] = _pid_fb
-else:
-    st.session_state.setdefault("fb_stats", {"disliked": set(), "liked": set(), "rating_avg": {}, "emo_stats": {}})
+def _fb_reload(pid: str):
+    if pid and st.session_state.get("_fb_pid") != pid:
+        st.session_state["fb_stats"] = load_feedback_stats(f"logs/experiment_{pid}.jsonl")
+        st.session_state["_fb_pid"] = pid
+    st.session_state.setdefault(
+        "fb_stats",
+        {"disliked": set(), "liked": set(), "rating_avg": {}, "emo_stats": {}},
+    )
 
-DEFAULT_TARGETS = {
-    "happy": {"val": 0.85, "eng": 0.75},
-    "sad": {"val": 0.20, "eng": 0.35},
-    "angry": {"val": 0.30, "eng": 0.90},
-    "neutral": {"val": 0.55, "eng": 0.50},
-}
-LABEL_SAFE_GENRES = {
-    "happy": ["dance", "pop", "electronic"],
-    "sad": ["indie", "chill", "pop"],
-    "angry": ["rock", "electronic", "indie"],
-    "neutral": ["pop", "indie", "dance"],
-}
+def get_audio_features_for_uri(sp: Spotify, uri: str) -> dict:
+    if not sp or not uri:
+        return {}
+    try:
+        track_id = uri.split(":")[-1]
+        feats_list = sp.audio_features([track_id])
+        if not feats_list or feats_list[0] is None:
+            return {}
+        f = feats_list[0]
+        return {"valence": f.get("valence"), "energy": f.get("energy"), "tempo": f.get("tempo")}
+    except Exception:
+        return {}
 
-def clean_profile(profile: Dict, label: str) -> Dict:
-    label = (label or "neutral").lower()
-    prof = dict(profile or {})
-    for k in list(prof.keys()):
-        if prof[k] is None:
-            prof.pop(k, None)
-    if "mean_valence" not in prof or "mean_energy" not in prof:
-        d = DEFAULT_TARGETS.get(label, DEFAULT_TARGETS["neutral"])
-        prof.setdefault("mean_valence", d["val"])
-        prof.setdefault("mean_energy", d["eng"])
-    return prof
-
-def fetch_audio_features_with_cache(sp, track_ids: List[str], sleep_between: float = 0.25, max_batch: int = 50) -> Dict[str, Dict]:
+def fetch_audio_features_with_cache(sp, track_ids: List[str],
+                                     sleep_between: float = 0.25,
+                                     max_batch: int = 50) -> Dict[str, Dict]:
     out = {}
     if st.session_state.get("block_spotify_features"):
         return out
     max_batch = min(max_batch, 20)
     cache = st.session_state["af_cache_by_id"]
-    fail = st.session_state["af_fail_ids"]
+    fail  = st.session_state["af_fail_ids"]
     pending = [tid for tid in track_ids if tid and tid not in cache and tid not in fail]
     for tid in track_ids:
         if tid in cache:
             out[tid] = cache[tid]
     for i in range(0, len(pending), max_batch):
-        chunk = pending[i : i + max_batch]
+        chunk = pending[i: i + max_batch]
         try:
             af_list = sp.audio_features(chunk) or []
             for f in af_list or []:
@@ -330,11 +644,7 @@ def fetch_audio_features_with_cache(sp, track_ids: List[str], sleep_between: flo
             status = getattr(e, "http_status", None)
             if status in (401, 403):
                 st.session_state["block_spotify_features"] = True
-                st.session_state["api_err"].add(f"audio_features stoppé (HTTP {status})")
                 break
-            if status == 429:
-                st.session_state["api_err"].add("Rate limit audio_features (429) - pause.")
-                time.sleep(1.0)
             for tid in chunk:
                 fail.add(tid)
         except Exception:
@@ -353,8 +663,8 @@ def _safe_audio_features(sp, uri: str) -> Dict:
         tid = (uri or "").split(":")[-1]
         if not tid:
             return {}
-        id_cache = st.session_state.get("af_cache_by_id", {})
-        fail_ids = st.session_state.get("af_fail_ids", set())
+        id_cache  = st.session_state.get("af_cache_by_id", {})
+        fail_ids  = st.session_state.get("af_fail_ids", set())
         uri_cache = st.session_state.get("features_cache", {})
         if tid in id_cache:
             return id_cache.get(tid) or {}
@@ -371,187 +681,47 @@ def _safe_audio_features(sp, uri: str) -> Dict:
         return feat
     except SpotifyException:
         st.session_state["block_spotify_features"] = True
-        try:
-            st.session_state["af_fail_ids"].add((uri or "").split(":")[-1])
-        except Exception:
-            pass
         return {}
     except Exception:
         return {}
-    
-# --- Audio features simplifiées pour le logging expérimental ---
-def simple_audio_features(sp, uri: str) -> dict:
-    """
-    Version locale pour contourner les restrictions Spotify (403).
-    Génère des valences/énergies réalistes selon l'émotion finale.
-    Permet de remplir le log + visualisation sans dépendre de Spotify.
-    """
 
-    # ⚠️ On récupère l'émotion finale (sinon neutral par défaut)
-    emo = st.session_state.get("final_emotion", "neutral")
+def clean_profile(profile: Dict, label: str) -> Dict:
+    label = (label or "neutral").lower()
+    prof = dict(profile or {})
+    for k in list(prof.keys()):
+        if prof[k] is None:
+            prof.pop(k, None)
+    if "mean_valence" not in prof or "mean_energy" not in prof:
+        d = DEFAULT_TARGETS.get(label, DEFAULT_TARGETS["neutral"])
+        prof.setdefault("mean_valence", d["val"])
+        prof.setdefault("mean_energy",  d["eng"])
+    return prof
 
-    # Valeurs réalistes basées sur ton modèle émotionnel
-    base_map = {
-        "happy":   {"valence": 0.85, "energy": 0.75},
-        "sad":     {"valence": 0.25, "energy": 0.30},
-        "angry":   {"valence": 0.30, "energy": 0.90},
-        "neutral": {"valence": 0.55, "energy": 0.50},
-    }
-
-    base = base_map.get(emo, base_map["neutral"])
-
-    # Petite variation pour que les points ne se superposent pas
-    import random
-    return {
-        "valence": round(base["valence"] + random.uniform(-0.05, 0.05), 3),
-        "energy":  round(base["energy"]  + random.uniform(-0.05, 0.05), 3),
-        "tempo": random.randint(80, 130),
-    }
-
-def recommend_from_library(
-    sp,
-    label: str,
-    limit: int = 6,
-    exclude_uris=None,
-    profile: Dict = None,
-    max_fetch: int = 600,          # tu peux mettre 300/600/1000
-    prefer_feature_candidates: int = 120,  # nb max de tracks évaluées via audio_features
-):
-    import random
-
-    label = (label or "neutral").lower().strip()
-    profile = profile or {}
-
-    d = DEFAULT_TARGETS.get(label, DEFAULT_TARGETS["neutral"])
-    tgt_val = float(profile.get("mean_valence", d["val"]))
-    tgt_eng = float(profile.get("mean_energy", d["eng"]))
-
-    ex = set(exclude_uris or [])
-
-    # 1) Charger des liked songs (saved tracks) jusqu'à max_fetch ou assez de candidats
-    items = []
-    candidates = []
-
-    try:
-        offset = 0
-        while offset < max_fetch:
-            batch = sp.current_user_saved_tracks(limit=50, offset=offset) or {}
-            page = batch.get("items") or []
-            if not page:
-                break
-
-            items.extend(page)
-            for it in page:
-                t = it.get("track") or {}
-                uri = t.get("uri")
-                if uri and uri not in ex:
-                    candidates.append(t)
-
-            offset += 50
-
-            # si on a déjà pas mal de candidats, on peut arrêter tôt
-            if len(candidates) >= max(limit * 10, 60):
-                break
-    except Exception:
-        pass
-
-    if not candidates:
-        return []
-
-    # Dé-doublonnage par URI
-    uniq = []
-    seen = set()
-    for t in candidates:
-        uri = t.get("uri")
-        if uri and uri not in seen:
-            uniq.append(t)
-            seen.add(uri)
-    candidates = uniq
-
-    if len(candidates) <= limit:
-        return candidates[: max(1, limit)]
-
-    # 2) Essayer audio_features sur un sous-ensemble (sinon 403/429 peuvent te bloquer)
-    # On prend un échantillon stable de candidats
-    pool = candidates[:]
-    random.shuffle(pool)
-    pool = pool[: max(prefer_feature_candidates, limit)]
-
-    ids = [t.get("id") for t in pool if t.get("id")]
-    feats_map = {}
-    try:
-        feats_map = fetch_audio_features_with_cache(
-            sp, ids, sleep_between=0.0, max_batch=20
-        ) or {}
-    except Exception:
-        feats_map = {}
-
-    if feats_map:
-        scored = []
-        for t in pool:
-            tid = t.get("id")
-            if not tid:
-                continue
-            f = feats_map.get(tid)
-            if not f:
-                continue
-            v = f.get("valence")
-            e = f.get("energy")
-            if v is None or e is None:
-                continue
-
-            dist = (float(v) - tgt_val) ** 2 + (float(e) - tgt_eng) ** 2
-            scored.append((dist, t))
-
-        scored.sort(key=lambda x: x[0])
-        ranked = [t for _, t in scored]
-
-        # compléter si pas assez (cas features manquantes)
-        if len(ranked) < limit:
-            ranked_uris = {t.get("uri") for t in ranked if t.get("uri")}
-            for t in candidates:
-                uri = t.get("uri")
-                if uri and uri not in ranked_uris:
-                    ranked.append(t)
-                    ranked_uris.add(uri)
-                if len(ranked) >= limit:
-                    break
-
-        return ranked[: max(1, limit)]
-
-    # 3) Fallback si features bloquées (403) -> random mais toujours remplir si possible
-    random.shuffle(candidates)
-    return candidates[: max(1, limit)]
-
-
-def reset_session():
-    pid = st.session_state.get("pid")
-    if pid:
-        p = f".cache-{pid}"
-        if os.path.exists(p):
-            try: os.remove(p)
-            except: pass
-    st.session_state.clear()
-    st.rerun()
-
-def purge_all_cache():
-    import glob, shutil
-    removed = 0
-    for p in glob.glob(".cache-*") + [".cache-spotipy"]:
-        try:
-            if os.path.isdir(p):
-                shutil.rmtree(p, ignore_errors=True); removed += 1
-            elif os.path.isfile(p):
-                os.remove(p); removed += 1
-        except Exception:
-            pass
-    try:
-        import streamlit as _st; _st.cache_data.clear()
-    except Exception: pass
-    try:
-        import streamlit as _st; _st.cache_resource.clear()
-    except Exception: pass
-    return removed
+def _sanitize_and_shorten_seeds(seeds: Dict, label: str) -> Dict:
+    s = dict(seeds or {})
+    label_l = (label or "neutral").lower()
+    rot_map = st.session_state.setdefault("_seed_rot", {})
+    rot = int(rot_map.get(label_l, 0))
+    base_artists = list(s.get("artists") or [])
+    base_tracks  = list(s.get("tracks")  or [])
+    def _pick_rot(lst, k):
+        if not lst: return []
+        n = min(k, len(lst))
+        start = rot % len(lst)
+        return [lst[(start + i) % len(lst)] for i in range(n)]
+    safe_genres = LABEL_SAFE_GENRES.get(label_l, LABEL_SAFE_GENRES["neutral"])
+    genres_in   = list(dict.fromkeys(s.get("genres") or []))
+    base        = [g for g in genres_in if g and g.lower() not in ("hip-hop", "hiphop", "rap")]
+    if not base: base = safe_genres
+    mixed_all   = list(dict.fromkeys(safe_genres + base + genres_in))
+    mixed_all   = [g for g in mixed_all if g and g.lower() not in ("hip-hop", "hiphop", "rap")]
+    if not mixed_all: mixed_all = safe_genres
+    s["artists"] = _pick_rot(base_artists, 2)
+    s["tracks"]  = _pick_rot(base_tracks, 2)
+    s["genres"]  = _pick_rot(mixed_all, 3)
+    s["profile"] = clean_profile(s.get("profile"), label_l)
+    rot_map[label_l] = rot + 1
+    return s
 
 def cold_start_preferences():
     st.info("Personnalisation initiale.")
@@ -561,21 +731,21 @@ def cold_start_preferences():
         default=["pop","dance"],
     )
     energy = st.slider("Énergie cible", 0.0, 1.0, 0.6, 0.05)
-    mood = st.slider("Valence", 0.0, 1.0, 0.6, 0.05)
-    tempo = st.slider("Tempo (BPM)", 60, 180, 120, 5)
+    mood   = st.slider("Valence", 0.0, 1.0, 0.6, 0.05)
     if st.button("Enregistrer préférences"):
         st.session_state["seeds"] = {
-            "artists": [],
-            "tracks": [],
-            "genres": genres[:3] or ["pop","dance"],
-            "profile": {"mean_valence": mood, "mean_energy": energy, "mean_tempo": tempo},
+            "artists": [], "tracks": [],
+            "genres":  genres[:3] or ["pop","dance"],
+            "profile": {"mean_valence": mood, "mean_energy": energy},
         }
         st.success("Préférences sauvegardées.")
 
 def ensure_seeds(spif: SpotifyInterface):
     if "seeds" in st.session_state:
-        st.session_state["seeds"]["profile"] = clean_profile(st.session_state["seeds"].get("profile"), "neutral")
-        safe = ["pop", "indie", "dance"]
+        st.session_state["seeds"]["profile"] = clean_profile(
+            st.session_state["seeds"].get("profile"), "neutral"
+        )
+        safe = ["pop","indie","dance"]
         g = list(dict.fromkeys((st.session_state["seeds"].get("genres") or []) + safe))
         st.session_state["seeds"]["genres"] = g[:5]
         return
@@ -583,18 +753,22 @@ def ensure_seeds(spif: SpotifyInterface):
     if not prof["artists"] and not prof["tracks"] and not prof["genres"]:
         cold_start_preferences()
         if "seeds" not in st.session_state:
-            st.session_state["seeds"] = {"artists": [], "tracks": [], "genres": ["pop","dance"], "profile": {}}
+            st.session_state["seeds"] = {
+                "artists": [], "tracks": [], "genres": ["pop","dance"], "profile": {}
+            }
     else:
         st.session_state["seeds"] = prof
-    st.session_state["seeds"]["profile"] = clean_profile(st.session_state["seeds"].get("profile"), "neutral")
-    safe = ["pop", "indie", "dance"]
+    st.session_state["seeds"]["profile"] = clean_profile(
+        st.session_state["seeds"].get("profile"), "neutral"
+    )
+    safe = ["pop","indie","dance"]
     g = list(dict.fromkeys((st.session_state["seeds"].get("genres") or []) + safe))
     st.session_state["seeds"]["genres"] = g[:5]
 
 def manual_auth_ui(spif: SpotifyInterface, key_prefix: str = "auth"):
     with st.expander("Autorisation manuelle Spotify"):
         if not spif:
-            st.info("Client Spotify non initialisé. Cliquez d’abord sur 'Connexion Spotify / Seeds'.")
+            st.info("Client Spotify non initialisé.")
             return
         url = None
         try:
@@ -604,64 +778,26 @@ def manual_auth_ui(spif: SpotifyInterface, key_prefix: str = "auth"):
         except Exception:
             pass
         if url:
-            st.link_button("Ouvrir la page d'autorisation Spotify", url, key=f"{key_prefix}_auth_link")
-        else:
-            st.info("Relancez 'Connexion Spotify / Seeds' si aucun lien n'apparaît.")
-        try:
-            st.caption(f"Redirect URI attendue: {spif.current_redirect_uri()}")
-        except Exception:
-            pass
-        col1, col2 = st.columns(2)
+            st.link_button("Ouvrir la page d'autorisation Spotify", url, key=f"{key_prefix}_link")
+        col1, _ = st.columns(2)
         with col1:
-            if st.button("Vider cache OAuth", key=f"{key_prefix}_clear_cache"):
+            if st.button("Vider cache OAuth", key=f"{key_prefix}_clear"):
                 try: spif.clear_cache()
                 except Exception: pass
-                st.success("Cache Spotipy vidé. Réessayez la connexion.")
-        with col2:
-            st.caption("Après autorisation, revenez et cliquez à nouveau sur 'Connexion Spotify / Seeds'.")
-
-def _sanitize_and_shorten_seeds(seeds: Dict, label: str) -> Dict:
-    s = dict(seeds or {})
-    label_l = (label or "neutral").lower()
-    rot_map = st.session_state.setdefault("_seed_rot", {})
-    rot = int(rot_map.get(label_l, 0))
-    base_artists = list(s.get("artists") or [])
-    base_tracks = list(s.get("tracks") or [])
-    def _pick_rot(lst, k):
-        if not lst: return []
-        n = min(k, len(lst))
-        start = rot % len(lst)
-        return [lst[(start + i) % len(lst)] for i in range(n)]
-    artists = _pick_rot(base_artists, 2)
-    tracks = _pick_rot(base_tracks, 2)
-    safe_genres = LABEL_SAFE_GENRES.get(label_l, LABEL_SAFE_GENRES["neutral"])
-    genres_in = list(dict.fromkeys(s.get("genres") or []))
-    base = [g for g in genres_in if g and g.lower() not in ("hip-hop", "hiphop", "rap")]
-    if not base: base = safe_genres
-    mixed_all = list(dict.fromkeys(safe_genres + base + genres_in))
-    mixed_all = [g for g in mixed_all if g and g.lower() not in ("hip-hop", "hiphop", "rap")]
-    if not mixed_all: mixed_all = safe_genres
-    genres = _pick_rot(mixed_all, 3)
-    s["artists"] = artists
-    s["tracks"] = tracks
-    s["genres"] = genres
-    s["profile"] = clean_profile(s.get("profile"), label_l)
-    rot_map[label_l] = rot + 1
-    return s
+                st.success("Cache vidé.")
 
 def _collect_user_signals(sp) -> Dict[str, set]:
     st.session_state.setdefault("_user_top_artist_ids", None)
     st.session_state.setdefault("_user_liked_track_ids", None)
     if st.session_state["_user_top_artist_ids"] is None:
-        top_artists_ids = set()
+        top_artist_ids = set()
         try:
             ta = sp.current_user_top_artists(limit=20, time_range="medium_term") or {}
             for a in ta.get("items") or []:
-                if a.get("id"):
-                    top_artists_ids.add(a["id"])
+                if a.get("id"): top_artist_ids.add(a["id"])
         except Exception:
             pass
-        st.session_state["_user_top_artist_ids"] = top_artists_ids
+        st.session_state["_user_top_artist_ids"] = top_artist_ids
     if st.session_state["_user_liked_track_ids"] is None:
         liked_ids = set()
         try:
@@ -707,23 +843,94 @@ def _rerank_tracks_personalized(tracks: List[Dict], label: str, sp) -> List[Dict
         aid = ((t.get("artists") or [{}])[0] or {}).get("id")
         aff = 0.0
         if tid in liked: aff += 1.5
-        if aid in ta: aff += 1.0
-        emo = _emotion_distance_score(t, label, sp)
+        if aid in ta:    aff += 1.0
+        emo   = _emotion_distance_score(t, label, sp)
         score = 0.65 * aff + 0.35 * emo
         scored.append((score, t))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [t for _, t in scored]
 
-def _robust_recommend(spif: SpotifyInterface, label: str, seeds_mod: Dict, limit: int, exclude_uris):
+def recommend_from_library(sp, label: str, limit: int = 6,
+                            exclude_uris=None, profile: Dict = None,
+                            max_fetch: int = 600) -> List[Dict]:
+    label = (label or "neutral").lower().strip()
+    profile = profile or {}
+    d = DEFAULT_TARGETS.get(label, DEFAULT_TARGETS["neutral"])
+    tgt_val = float(profile.get("mean_valence", d["val"]))
+    tgt_eng = float(profile.get("mean_energy",  d["eng"]))
+    ex = set(exclude_uris or [])
+    items = []; candidates = []
+    try:
+        offset = 0
+        while offset < max_fetch:
+            batch = sp.current_user_saved_tracks(limit=50, offset=offset) or {}
+            page  = batch.get("items") or []
+            if not page: break
+            items.extend(page)
+            for it in page:
+                t = it.get("track") or {}
+                uri = t.get("uri")
+                if uri and uri not in ex: candidates.append(t)
+            offset += 50
+            if len(candidates) >= max(limit * 10, 60): break
+    except Exception:
+        pass
+    if not candidates: return []
+    uniq = []; seen = set()
+    for t in candidates:
+        uri = t.get("uri")
+        if uri and uri not in seen:
+            uniq.append(t); seen.add(uri)
+    candidates = uniq
+    if len(candidates) <= limit:
+        return candidates[: max(1, limit)]
+    pool = candidates[:]; random.shuffle(pool); pool = pool[:120]
+    ids = [t.get("id") for t in pool if t.get("id")]
+    feats_map = {}
+    try:
+        feats_map = fetch_audio_features_with_cache(sp, ids, sleep_between=0.0, max_batch=20) or {}
+    except Exception:
+        pass
+    if feats_map:
+        scored = []
+        for t in pool:
+            tid = t.get("id")
+            if not tid: continue
+            f = feats_map.get(tid)
+            if not f: continue
+            v = f.get("valence"); e = f.get("energy")
+            if v is None or e is None: continue
+            dist = (float(v) - tgt_val) ** 2 + (float(e) - tgt_eng) ** 2
+            scored.append((dist, t))
+        scored.sort(key=lambda x: x[0])
+        ranked = [t for _, t in scored]
+        if len(ranked) < limit:
+            ranked_uris = {t.get("uri") for t in ranked if t.get("uri")}
+            for t in candidates:
+                uri = t.get("uri")
+                if uri and uri not in ranked_uris:
+                    ranked.append(t); ranked_uris.add(uri)
+                if len(ranked) >= limit: break
+        return ranked[: max(1, limit)]
+    random.shuffle(candidates)
+    return candidates[: max(1, limit)]
+
+def _fallback_tracks(spif, market, base_label, seeds_mod, exclude):
+    try:
+        rec = (spif.sp.recommendations(
+            seed_genres=",".join((seeds_mod.get("genres") or [])[:5] or ["pop","indie","dance"]),
+            limit=10, market=market) or {})
+        tracks = [t for t in rec.get("tracks") or [] if t.get("uri")]
+        return tracks[:6]
+    except Exception:
+        return []
+
+def _robust_recommend(spif: SpotifyInterface, label: str,
+                       seeds_mod: Dict, limit: int, exclude_uris) -> List[Dict]:
     if not st.session_state.get("spotify_ready"):
         return []
     label = (label or "neutral").lower()
     seeds_local = dict(seeds_mod or {})
-    try:
-        if (len(seeds_local.get("genres") or []) <= 1) and not (seeds_local.get("artists") or seeds_local.get("tracks")):
-            seeds_local["profile"] = {}
-    except Exception:
-        pass
     def _call(seeds, rerank=True):
         return (recommend_for_emotion(
             spif.sp, spif.market, label, seeds,
@@ -732,59 +939,33 @@ def _robust_recommend(spif: SpotifyInterface, label: str, seeds_mod: Dict, limit
             exclude_uris=exclude_uris,
         ) or [])
     tracks = []
-    first_404 = False
     try:
         tracks = _call(seeds_local, rerank=True)
     except SpotifyException as e:
-        status = getattr(e, "http_status", None)
-        if status == 404:
-            first_404 = True
-        elif status in (401, 403, 429):
+        http_status = getattr(e, "http_status", None)
+        if http_status in (401, 403, 429):
             st.session_state["block_spotify_features"] = True
-            st.session_state["api_err"].add(f"Reco HTTP {status} (tentative 1)")
-        else:
-            st.session_state["api_err"].add(f"Reco 1: {e}")
-        tracks = []
     except Exception as e:
-        st.session_state["api_err"].add(f"Reco 1: {e}")
-        tracks = []
-    if first_404 and not tracks:
-        try:
-            seeds_np = dict(seeds_local); seeds_np["profile"] = {}
-            tracks = _call(seeds_np, rerank=False)
-            if tracks:
-                st.caption("Reco obtenues après retrait des cibles (profil).")
-            else:
-                seeds_local = seeds_np
-        except Exception as e:
-            st.session_state["api_err"].add(f"Retry no-profile: {e}")
-            tracks = []
+        st.session_state["api_err"].add(str(e))
     if not tracks:
         try:
             tracks = _call(seeds_local, rerank=False)
-        except Exception as e:
-            st.session_state["api_err"].add(f"Reco retry sans rerank: {e}")
-            tracks = []
+        except Exception:
+            pass
     if not tracks:
         safe_only = dict(seeds_local)
         safe_only["artists"] = []; safe_only["tracks"] = []
-        safe_only["genres"] = LABEL_SAFE_GENRES.get(label, LABEL_SAFE_GENRES["neutral"])
+        safe_only["genres"]  = LABEL_SAFE_GENRES.get(label, LABEL_SAFE_GENRES["neutral"])
         safe_only["profile"] = {}
         try:
             tracks = _call(safe_only, rerank=False)
-            if tracks:
-                st.caption("Reco récupérées (mode safe).")
-        except Exception as e:
-            st.session_state["api_err"].add(f"Reco safe: {e}")
-            tracks = []
+        except Exception:
+            pass
     if not tracks:
-        base = locals().get("safe_only", seeds_local)
         try:
-            exclude = set()
-            tracks = _fallback_tracks(spif, spif.market, label, base, exclude) or []
-        except Exception as e:
-            st.session_state["api_err"].add(f"Fallback exception: {e}")
-            tracks = []
+            tracks = _fallback_tracks(spif, spif.market, label, seeds_local, set()) or []
+        except Exception:
+            pass
     if tracks:
         try:
             tracks = _rerank_tracks_personalized(tracks, label, spif.sp)[:limit]
@@ -792,905 +973,943 @@ def _robust_recommend(spif: SpotifyInterface, label: str, seeds_mod: Dict, limit
             pass
     return tracks or []
 
-if "_fallback_tracks" not in globals():
-    def _fallback_tracks(spif, market, base_label, seeds_mod, exclude):
+def reset_session():
+    pid = st.session_state.get("pid")
+    if pid:
+        p = f".cache-{pid}"
+        if os.path.exists(p):
+            try: os.remove(p)
+            except: pass
+    st.session_state.clear()
+    st.rerun()
+
+def purge_all_cache():
+    import glob, shutil
+    removed = 0
+    for p in glob.glob(".cache-*") + [".cache-spotipy"]:
         try:
-            rec = (spif.sp.recommendations(
-                seed_genres=",".join((seeds_mod.get("genres") or [])[:5] or ["pop","indie","dance"]),
-                limit=10, market=market) or {})
-            tracks = [t for t in rec.get("tracks") or [] if t.get("uri")]
-            return tracks[:6]
-        except Exception:
-            return []
-
-def _fr_text_heuristic(txt: str) -> Dict[str, float]:
-    t = (txt or "").lower()
-    if any(w in t for w in ("triste","malheureux","malheur","déprim","deprim","chagrin")):
-        return {"sad": 0.9}
-    if any(w in t for w in (
-        "nerveux", "nerveuse", "stressé", "stresse", "stressée", "stressee",
-        "anxieux", "anxieuse", "angoissé", "angoissee", "angoissé(e)", "angoisse"
-    )): 
-        return {"angry": 0.85, "neutral": 0.15}
-    if any(w in t for w in ("heureux","heureuse","content","contente","joie","ravi","ravie")):
-        return {"happy": 0.9}
-    if any(w in t for w in ("neutre","ok","normal")):
-        return {"neutral": 0.8}
-    return {}
-
-def derive_s2_preferences(messages: List[str]) -> Dict[str, float]:
-    txt = " ".join(messages).lower()
-    out = {"mean_valence": None, "mean_energy": None}
-    if "calme" in txt or "relax" in txt:
-        out["mean_energy"] = 0.3
-    if any(k in txt for k in ("énergie","energie","dynamique")):
-        out["mean_energy"] = max(out["mean_energy"] or 0.0, 0.6)
-    if "sombre" in txt or "dark" in txt:
-        out["mean_valence"] = 0.3
-    if "lumineux" in txt or "bright" in txt:
-        out["mean_valence"] = 0.7
-    return out
-
-def face_local_video_7s(key: str, seconds: float = 10.0, manual_validate: bool = True) -> Dict:
-    final_key = f"{key}_final"
-    cap_key = f"{key}_cap"
-    start_key = f"{key}_start"
-    frames_key = f"{key}_frames"
-    count_key = f"{key}_count"
-    faces_seen_key = f"{key}_faces_seen"
-
-    st.subheader("Détection faciale (caméra locale 10s)")
-
-    if final_key in st.session_state:
-        fin = st.session_state[final_key]
-        st.success(f"Mesure validée: {fin['label']}")
-        if manual_validate and st.button("Refaire", key=f"{key}_redo"):
-            for k in (final_key, cap_key, start_key, frames_key, count_key, faces_seen_key):
-                st.session_state.pop(k, None)
-            st.rerun()
-        return {"done": True, "label": fin["label"], "probs": fin["probs"]}
-
-    if cap_key not in st.session_state:
-        if st.button("Ouvrir caméra", key=f"{key}_open"):
-            cap = cv2.VideoCapture(0)
-            if not cap or not cap.isOpened():
-                st.error("Impossible d'ouvrir la caméra.")
-                return {"done": False, "label": None, "probs": {}}
-            st.session_state[cap_key] = cap
-            st.session_state[start_key] = time.time()
-            st.session_state[frames_key] = deque()
-            st.session_state[count_key] = 0
-            st.session_state[faces_seen_key] = False
-            st.rerun()
-        else:
-            st.info("Cliquez sur 'Ouvrir caméra' pour démarrer la mesure (10s).")
-            return {"done": False, "label": None, "probs": {}}
-
-    cap = st.session_state[cap_key]
-    ret, frame = cap.read()
-    if not ret:
-        st.error("Lecture frame impossible.")
-        cap.release()
-        st.session_state.pop(cap_key, None)
-        return {"done": False, "label": None, "probs": {}}
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    st.session_state[count_key] += 1
-    fc = st.session_state[count_key]
-
-    faces = _FACE_CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(70, 70))
-    probs: Dict[str, float] = {}
-    label = "neutral"
-
-    if len(faces) > 0:
-        x, y, w, h = faces[0]
-        face_bgr = frame[y:y+h, x:x+w]
-        try:
-            if w >= 80 and h >= 80:
-                face_bgr = cv2.resize(face_bgr, (256, 256), interpolation=cv2.INTER_LINEAR)
-            gmean = float(cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY).mean())
-            gamma = 1.0 if 90 <= gmean <= 160 else (1.15 if gmean < 90 else 0.9)
-            table = ((np.arange(256) / 255.0) ** (1.0 / gamma) * 255.0).astype("uint8")
-            face_bgr = cv2.LUT(face_bgr, table)
-            face_bgr = cv2.fastNlMeansDenoisingColored(face_bgr, None, 2, 2, 7, 21)
+            if os.path.isdir(p):   shutil.rmtree(p, ignore_errors=True); removed += 1
+            elif os.path.isfile(p): os.remove(p); removed += 1
         except Exception:
             pass
+    try:
+        import streamlit as _st; _st.cache_data.clear()
+    except Exception: pass
+    try:
+        import streamlit as _st; _st.cache_resource.clear()
+    except Exception: pass
+    return removed
 
-        if fc % FRAME_INTERVAL_DEEPFACE == 0 and is_ready():
-            try:
-                res = analyze_emotion(face_bgr, detector_backend="skip", enforce_detection=False)
-                if isinstance(res, list) and res: res = res[0]
-                em = (res or {}).get("emotion") or {}
-                s = float(sum(em.values()) or 0.0)
-                if s > 0:
-                    probs = _map7to4(em)
-                if not probs:
-                    import os as _os
-                    be = _os.getenv("F2M_DETECTOR_BACKEND", "mediapipe")
-                    res2 = analyze_emotion(frame, detector_backend=be, enforce_detection=False)
-                    if isinstance(res2, list) and res2: res2 = res2[0]
-                    em2 = (res2 or {}).get("emotion") or {}
-                    s2 = float(sum(em2.values()) or 0.0)
-                    if s2 > 0:
-                        probs = _map7to4(em2)
-            except Exception:
-                probs = {}
+def get_lastfm_client() -> "LastFMInterface | None":
+    """
+    Retourne un singleton LastFMInterface depuis la session_state.
+    Retourne None si la clé API n'est pas configurée ou si pylast manque.
+    """
+    if not lastfm_available():
+        return None
+    api_key    = os.getenv("LASTFM_API_KEY", "").strip()
+    api_secret = os.getenv("LASTFM_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        return None
+    username = st.session_state.get("lastfm_username", "").strip() or None
+    # Recréer si le username a changé
+    cached = st.session_state.get("_lastfm_client")
+    cached_user = st.session_state.get("_lastfm_client_user")
+    if cached and cached_user == username:
+        return cached
+    try:
+        client = LastFMInterface(api_key, api_secret, username=username)
+        st.session_state["_lastfm_client"]      = client
+        st.session_state["_lastfm_client_user"] = username
+        return client
+    except Exception:
+        return None
 
-        if not probs:
-            roi_gray = gray[y:y+h, x:x+w]
-            mean = float(roi_gray.mean()); std = float(roi_gray.std())
-            val = max(0.0, min(1.0, (mean - 60.0) / 120.0))
-            eng = max(0.0, min(1.0, (std - 20.0) / 80.0))
-            if val > 0.65 and eng > 0.35:
-                probs = {"happy": 0.7, "neutral": 0.3}
-            elif val < 0.35 and eng < 0.40:
-                probs = {"sad": 0.6, "neutral": 0.4}
-            else:
-                probs = {"neutral": 1.0}
 
-        label = max(probs, key=probs.get)
-        st.session_state[faces_seen_key] = True
-
-        cv2.rectangle(rgb, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(rgb, label, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        try:
-            tops = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            cv2.putText(rgb, " / ".join(f"{k}:{v:.2f}" for k, v in tops), (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        except Exception:
-            pass
-    else:
-        label = "Aucun visage"
-        probs = {}
-
-    # Empile (avec lissage exponentiel)
-    if probs:
-        s = float(sum(probs.values()) or 1.0)
-        probs = {k: float(v) / s for k, v in probs.items()}
-        last = st.session_state[frames_key][-1] if st.session_state[frames_key] else None
-        if last:
-            KEYS = {"happy", "sad", "angry", "neutral"}
-            ALPHA = 0.6
-            smoothed = {k: ALPHA * probs.get(k, 0.0) + (1.0 - ALPHA) * last.get(k, 0.0) for k in KEYS}
-            z = sum(smoothed.values()) or 1.0
-            probs = {k: v / z for k, v in smoothed.items()}
-        st.session_state[frames_key].append(probs)
-
-    st.image(rgb, channels="RGB", caption=f"{label} | frame={fc}", use_container_width=True)
-    elapsed = time.time() - st.session_state[start_key]
-    st.progress(min(1.0, elapsed / seconds), text="Mesure en cours...")
-    st.caption(f"Frames valides (visage détecté): {len(st.session_state[frames_key])}")
-
-    if elapsed < seconds:
-        time.sleep(0.04)
-        st.rerun()
-
-    valid_frames = len(st.session_state[frames_key])
-    if (not st.session_state.get(faces_seen_key)) or valid_frames < MIN_VALID_FRAMES:
-        st.warning("Aucun visage ou trop peu de frames valides. Recommencez.")
-        if st.button("Recommencer", key=f"{key}_retry"):
-            cap.release()
-            for k in (cap_key, start_key, frames_key, count_key, faces_seen_key):
-                st.session_state.pop(k, None)
-            st.rerun()
-        else:
-            cap.release()
-            st.session_state.pop(cap_key, None)
-        return {"done": False, "label": None, "probs": {}}
-
-    agg: Dict[str, float] = {}
-    for p in st.session_state[frames_key]:
-        for k, v in p.items():
-            agg[k] = agg.get(k, 0.0) + float(v)
-    total = float(sum(agg.values()) or 1.0)
-    final_probs = {k: v / total for k, v in agg.items()}
-    final_label = max(final_probs, key=final_probs.get)
-
-    if manual_validate:
-        st.info(f"Émotion estimée: {final_label}")
-        if st.button("Valider mesure", key=f"{key}_validate"):
-            st.session_state[final_key] = {"label": final_label, "probs": final_probs}
-            cap.release()
-            st.session_state.pop(cap_key, None)
-            st.rerun()
-        return {"done": False, "label": None, "probs": {}}
-    else:
-        st.session_state[final_key] = {"label": final_label, "probs": final_probs}
-        cap.release()
-        st.session_state.pop(cap_key, None)
-        return {"done": True, "label": final_label, "probs": final_probs}
 def update_fb_stats(track_uri: str, label: str, rating: int, like: bool, dislike: bool):
-    """
-    Stocke des stats simples dans session_state pour reranking futur.
-    - par émotion (label)
-    - par track_uri
-    """
-    if not track_uri:
-        return
-
+    if not track_uri: return
     label = (label or "neutral").lower()
     st.session_state.setdefault("fb_stats", {})
     stats = st.session_state["fb_stats"]
-
     stats.setdefault(label, {})
     stats[label].setdefault(track_uri, {"likes": 0, "dislikes": 0, "ratings": []})
-
-    if like:
-        stats[label][track_uri]["likes"] += 1
-    if dislike:
-        stats[label][track_uri]["dislikes"] += 1
-
-    # garde un historique (petit) de ratings
+    if like:    stats[label][track_uri]["likes"]   += 1
+    if dislike: stats[label][track_uri]["dislikes"] += 1
     if isinstance(rating, int):
         stats[label][track_uri]["ratings"].append(rating)
         stats[label][track_uri]["ratings"] = stats[label][track_uri]["ratings"][-20:]
 
 
-def playback_and_log_ui(
-    pid: str,
-    scenario: str,
-    face: Dict,
-    text: Dict,
-    fused_label: str,
-    tracks: List[Dict],
-    spif: SpotifyInterface,
-):
-    st.subheader("Titres recommandés")
+# ──────────────────────────────────────────────────────────────────────────────
+# Fragment caméra — auto-refresh toutes les 0.5s (Streamlit ≥ 1.33)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # chemin du log (unchanged)
-    log_path = f"logs/experiment_{pid}.jsonl"
-    seeds = st.session_state.get("seeds", {})
+_EMOTION_COLORS = {
+    "happy":   "#f59e0b",
+    "sad":     "#3b82f6",
+    "angry":   "#ef4444",
+    "neutral": "#10b981",
+}
 
+
+@st.fragment(run_every=0.25)
+def _camera_live_fragment() -> None:
+    """Affiche frame + badge EMA + barres de confiance. Rafraîchi 4×/s."""
+    with _CAM_LOCK:
+        frame     = _CAM_STATE.get("frame_rgb")
+        label     = _CAM_STATE.get("label", "neutral")
+        probs_ema = dict(_CAM_STATE.get("probs_ema", {"neutral": 1.0}))
+        running   = _CAM_STATE.get("running", False)
+
+    color = _EMOTION_COLORS.get(label, "#8b5cf6")
+
+    if running and frame is not None:
+        st.markdown(
+            '<div class="camera-container">'
+            '<div class="camera-scan"></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.image(frame, channels="RGB", use_container_width=True)
+        st.markdown(
+            f'<div class="emotion-badge emotion-badge-{label}" '
+            f'style="border-color:{color}; color:{color}; '
+            f'background:rgba({_hex_to_rgb(color)},0.12);">'
+            f'◉ {label.upper()}</div>',
+            unsafe_allow_html=True,
+        )
+        # Barres de confiance EMA
+        for emotion, prob in sorted(probs_ema.items(), key=lambda kv: kv[1], reverse=True):
+            st.progress(float(prob), text=f"{emotion} {prob:.0%}")
+    elif running:
+        st.info("Initialisation caméra…")
+    else:
+        st.caption("Caméra inactive — cliquez sur ▶ Démarrer")
+
+
+def _hex_to_rgb(hex_color: str) -> str:
+    """Convertit #RRGGBB en 'R,G,B' pour CSS rgba()."""
+    h = hex_color.lstrip("#")
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"{r},{g},{b}"
+    except Exception:
+        return "139,92,246"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Génération URL plateforme (YouTube / Apple Music)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_platform_url(platform: str, artists: List[str], genres: List[str]) -> str:
+    """
+    Construit une URL de recherche pour YouTube ou Apple Music à partir des
+    artistes et genres suggérés par l'agent V3.
+    """
+    parts = (artists[:1] or []) + (genres[:2] or [])
+    query = " ".join(parts).strip()
+    if not query:
+        query = "musique"
+    q_enc = urllib.parse.quote(query)
+    if platform == "YouTube":
+        return f"https://www.youtube.com/results?search_query={q_enc}"
+    if platform == "Apple Music":
+        return f"https://music.apple.com/search?term={q_enc}"
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rendu XAI — expander analyse cognitive
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _render_xai_expander(xai: Dict) -> None:
+    """
+    Affiche l'expander XAI sous la bulle de l'agent.
+    Contient : bpm_analysis, analyse_cognitive_interne, confidence_score, métriques.
+    """
+    with st.expander("🔬 Voir l'analyse cognitive (XAI — Chapitre 6)"):
+        # Métriques clés
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("🎵 Valence",   f"{xai.get('valence', 0):.2f}")
+        col2.metric("⚡ Énergie",    f"{xai.get('energy',  0):.2f}")
+        col3.metric("🎯 Confiance", f"{xai.get('confidence_score', 0):.0%}")
+        col4.metric("😊 Émotion",   xai.get("emotion", "—").capitalize())
+
+        st.divider()
+
+        # Analyse BPM
+        bpm_txt = xai.get("bpm_analysis", "")
+        if bpm_txt:
+            st.markdown("**Analyse physiologique (BPM)**")
+            st.info(bpm_txt)
+
+        # Raisonnement technique
+        cog = xai.get("analyse_cognitive_interne", "")
+        if cog:
+            st.markdown("**Raisonnement interne (XAI)**")
+            st.markdown(f"```\n{cog}\n```")
+
+        if xai.get("from_fallback"):
+            st.warning("⚠️ Mode compatibilité V1 — LLM indisponible lors de cette analyse.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rendu des recommandations musicales (multi-plateforme)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _render_music_block(music_data: Dict, spif, pid: str) -> None:
+    """
+    Affiche les recommandations musicales selon la plateforme choisie.
+    - Spotify → liste de tracks avec preview / embed + feedback
+    - YouTube / Apple Music → st.link_button stylé
+    """
+    if not music_data:
+        return
+
+    platform = music_data.get("platform", "Spotify")
+    label    = music_data.get("label", "neutral")
+    log_path = f"logs/experiment_{pid}.jsonl" if pid else "logs/experiment_demo.jsonl"
+
+    st.markdown("---")
+
+    if platform == "Last.fm":
+        # ── Last.fm tracks ───────────────────────────────────────────────────
+        tracks_lfm = music_data.get("tracks_lastfm", [])
+        badge_cls  = "platform-badge-lastfm"
+        st.markdown(
+            f'<span class="platform-badge {badge_cls}">🎵 Last.fm</span>',
+            unsafe_allow_html=True,
+        )
+        if not tracks_lfm:
+            lfm_key = os.getenv("LASTFM_API_KEY", "").strip()
+            if not lfm_key:
+                st.warning(
+                    "Clé Last.fm manquante. Ajoutez `LASTFM_API_KEY` dans `.env` "
+                    "et relancez l'app."
+                )
+            else:
+                st.info("Aucune recommandation Last.fm disponible pour cette émotion.")
+            return
+        st.markdown("**🎧 Recommandations Last.fm**")
+        for i, track in enumerate(tracks_lfm, 1):
+            title      = track.get("title", "—")
+            artist     = track.get("artist", "—")
+            url        = track.get("url", "")
+            image_url  = track.get("image_url", "")
+            col_img, col_info = st.columns([1, 5])
+            with col_img:
+                if image_url:
+                    st.image(image_url, width=52)
+                else:
+                    st.markdown(
+                        '<div style="width:52px;height:52px;background:rgba(139,92,246,0.15);'
+                        'border-radius:6px;display:flex;align-items:center;justify-content:center;'
+                        'font-size:1.4rem;">🎵</div>',
+                        unsafe_allow_html=True,
+                    )
+            with col_info:
+                st.markdown(f"**{i}. {title}**")
+                st.caption(f"🎤 {artist}")
+                embed_url = track.get("embed_url", "")
+                if embed_url:
+                    st.components.v1.html(
+                        f'<div style="overflow:hidden;border-radius:8px;">'
+                        f'<iframe src="{embed_url}" height="175" '
+                        f'allow="autoplay *; encrypted-media *; fullscreen *;" '
+                        f'sandbox="allow-forms allow-popups allow-same-origin allow-scripts '
+                        f'allow-storage-access-by-user-activation allow-top-navigation-by-user-activation" '
+                        f'frameborder="0" width="100%" style="border-radius:8px;"></iframe></div>',
+                        height=195,
+                    )
+                elif url:
+                    st.markdown(
+                        f'<a href="{url}" target="_blank" style="color:#8b5cf6;font-size:0.8rem;">🎵 Écouter sur Last.fm</a>',
+                        unsafe_allow_html=True,
+                    )
+        return
+
+    if platform == "YouTube":
+        url       = music_data.get("url", "")
+        artists   = music_data.get("artists", [])
+        genres    = music_data.get("genres",  [])
+        yt_videos = music_data.get("youtube_videos", [])
+        st.markdown(
+            '<span class="platform-badge platform-badge-youtube">▶️ YouTube</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"**Artistes suggérés :** {' · '.join(artists) if artists else '—'}")
+        st.markdown(f"**Genres :** {' · '.join(genres) if genres else '—'}")
+        if yt_videos:
+            for vid in yt_videos:
+                video_id = vid.get("video_id", "")
+                vtitle   = vid.get("title", "")
+                if not video_id:
+                    continue
+                if vtitle:
+                    st.caption(vtitle)
+                st.components.v1.iframe(
+                    f"https://www.youtube.com/embed/{video_id}",
+                    height=200,
+                )
+        elif url:
+            st.link_button("🎵 Écouter sur YouTube", url, use_container_width=True)
+        else:
+            st.warning("Impossible de générer le lien de recherche.")
+        return
+
+    if platform == "Apple Music":
+        url     = music_data.get("url", "")
+        artists = music_data.get("artists", [])
+        genres  = music_data.get("genres",  [])
+        st.markdown(
+            '<span class="platform-badge platform-badge-apple">🍎 Apple Music</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"**Artistes suggérés :** {' · '.join(artists) if artists else '—'}")
+        st.markdown(f"**Genres :** {' · '.join(genres) if genres else '—'}")
+        if url:
+            st.link_button("🍎 Écouter sur Apple Music", url, use_container_width=True)
+        else:
+            st.warning("Impossible de générer le lien de recherche.")
+        return
+
+    # ── Spotify tracks ─────────────────────────────────────────────────────
+    tracks = music_data.get("tracks", [])
+    if not tracks:
+        st.info("Aucun titre trouvé. Vérifiez votre connexion Spotify.")
+        return
+
+    st.markdown("**🎧 Recommandations Spotify**")
     for i, t in enumerate(tracks, 1):
-        name = t.get("name", "?")
-        artists = ", ".join(a.get("name", "") for a in t.get("artists", []))
-        uri = t.get("uri")
-        prev = t.get("preview_url")
+        name     = t.get("name", "?")
+        artists  = ", ".join(a.get("name", "") for a in t.get("artists", []))
+        uri      = t.get("uri")
+        prev     = t.get("preview_url")
         external = t.get("external_urls", {}).get("spotify")
 
         c1, c2, c3 = st.columns([4, 4, 2])
-
-        # ------- Colonne 1 : affichage du titre + preview -------
         with c1:
-            st.write(f"{i}. {name} — {artists}")
+            st.write(f"{i}. **{name}** — {artists}")
             if prev:
                 st.audio(prev)
             elif external:
-                st.components.v1.iframe(
-                    f"https://open.spotify.com/embed/track/{t.get('id')}?utm_source=generator",
-                    height=80,
+                track_id = t.get("id", "")
+                st.components.v1.html(
+                    f'<div style="background:rgba(139,92,246,0.05);border:1px solid '
+                    f'rgba(139,92,246,0.25);border-radius:12px;padding:10px;overflow:hidden;">'
+                    f'<iframe src="https://open.spotify.com/embed/track/{track_id}'
+                    f'?utm_source=generator" width="100%" height="152" frameborder="0" '
+                    f'allowtransparency="true" allow="encrypted-media"></iframe></div>',
+                    height=172,
                 )
             else:
-                st.caption("Pas d'extrait / preview")
+                st.caption("Pas d'extrait disponible")
 
-        # ------- Colonne 2 : feedback + log -------
         with c2:
-            rating = st.slider(
-                f"Compatibilité #{i}", 1, 5, 3, key=f"{scenario}_rate_{i}"
-            )
-            like = st.toggle(f"👍 #{i}", key=f"{scenario}_like_{i}")
-            played = st.toggle(f"Écouté #{i}", key=f"{scenario}_played_{i}")
-            dislike = st.toggle(f"👎 #{i}", key=f"{scenario}_dis_{i}")
-
+            rating  = st.slider(f"Compatibilité #{i}", 1, 5, 3, key=f"chat_rate_{music_data.get('turn_id',0)}_{i}")
+            like    = st.toggle(f"👍 #{i}", key=f"chat_like_{music_data.get('turn_id',0)}_{i}")
+            played  = st.toggle(f"Écouté #{i}", key=f"chat_play_{music_data.get('turn_id',0)}_{i}")
+            dislike = st.toggle(f"👎 #{i}", key=f"chat_dis_{music_data.get('turn_id',0)}_{i}")
             if dislike and uri:
                 st.session_state.setdefault("disliked_uris", set()).add(uri)
 
-            # BOUTON DE FEEDBACK
-            if st.button(f"Feedback #{i}", key=f"{scenario}_fb_{i}"):
-                # Petit message debug pour vérifier que le clic est bien pris
-                st.info(f"Enregistrement du feedback pour le titre #{i}…")
+            if st.button(f"Feedback #{i}", key=f"chat_fb_{music_data.get('turn_id',0)}_{i}"):
+                feats = get_audio_features_for_uri(spif.sp, uri) if uri and spif else {}
+                xai   = music_data.get("xai", {})
+                append_log_line(log_path, {
+                    "timestamp":    int(time.time() * 1000),
+                    "scenario":     "CHAT_V3",
+                    "pid":          pid,
+                    "track_uri":    uri,
+                    "track_name":   name,
+                    "track_artists": artists,
+                    "fused_label":  label,
+                    "rating":       int(rating),
+                    "like":         bool(like),
+                    "played":       bool(played),
+                    "dislike":      bool(dislike),
+                    "audio_features": feats,
+                    "platform":     platform,
+                    # Champs XAI V3
+                    "agent_message_utilisateur":    xai.get("message_utilisateur", ""),
+                    "agent_bpm_analysis":           xai.get("bpm_analysis", ""),
+                    "agent_analyse_cognitive":      xai.get("analyse_cognitive_interne", ""),
+                    "agent_valence":                xai.get("valence"),
+                    "agent_energy":                 xai.get("energy"),
+                    "agent_confidence":             xai.get("confidence_score"),
+                    "agent_suggested_genres":       xai.get("suggested_genres", []),
+                    "agent_suggested_artists":      xai.get("suggested_artists", []),
+                    "agent_bpm":                    xai.get("user_bpm"),
+                    "agent_from_fallback":          xai.get("from_fallback", False),
+                    "fusion_version": "V1" if xai.get("from_fallback") else "V3",
+                })
+                update_fb_stats(uri, label, int(rating), bool(like), bool(dislike))
+                st.success("✅ Feedback enregistré.")
 
-                # 🔥 récupération des audio features – ne casse jamais même si 403
-                feats = get_audio_features_for_uri(spif.sp, uri) if uri else {}
-
-                # écriture dans le log
-                append_log_line(
-                    log_path,
-                    {
-                        "timestamp": int(time.time() * 1000),
-                        "scenario": scenario,
-                        "pid": pid,
-                        "track_uri": uri,
-                        "track_name": name,
-                        "track_artists": artists,
-                        "fused_label": fused_label,
-                        "face_emotion": face,
-                        "text_emotion": text,
-                        "seeds": seeds,
-                        "rating": int(rating),
-                        "like": bool(like),
-                        "played": bool(played),
-                        "dislike": bool(dislike),
-                        "audio_features": feats,
-                    },
-                )
-                update_fb_stats(
-                   track_uri=uri,
-                   label=fused_label,
-                   rating=int(rating),
-                   like=bool(like),
-                   dislike=bool(dislike),
-                )
-
-
-                st.success("✅ Feedback enregistré dans le log.")
-
-        # ------- Colonne 3 : affichage des features à la demande -------
         with c3:
-            if st.button(f"Features #{i}", key=f"{scenario}_feat_{i}"):
-                if uri:
+            if st.button(f"Features #{i}", key=f"chat_feat_{music_data.get('turn_id',0)}_{i}"):
+                if uri and spif:
                     feats = get_audio_features_for_uri(spif.sp, uri)
                     if feats:
-                        st.write("Features Spotify (valence/energy/tempo) :")
                         st.json(feats)
                     else:
-                        st.warning(
-                            "Impossible de récupérer les audio features pour ce titre "
-                            "(probablement bloqué par l'API Spotify – 403)."
-                        )
+                        st.warning("Features indisponibles (API 403).")
 
-def scenario_s1(spif: SpotifyInterface, pid: str):
-    # --- 1) Détection faciale ---
-    face = face_local_video_7s("s1", manual_validate=True)
 
-    # --- 2) Correction texte (optionnelle) ---
-    st.subheader("Correction texte (facultatif)")
-    text_res = {"label": None, "probs": {}}
-    TEXT_OVERRIDE = 0.65
+# ──────────────────────────────────────────────────────────────────────────────
+# Génération musicale trimodale → données pour le chat
+# ──────────────────────────────────────────────────────────────────────────────
 
-    if face.get("done"):
-        corr = st.text_input(
-            "Décrivez votre ressenti si différent (optionnel)",
-            key="s1_corr",
-        )
-        if corr:
+def _generate_music_data(agent_result: Dict, spif, pid: str,
+                          platform: str, turn_id: int) -> Dict:
+    """
+    Prépare les données musicales à afficher dans le chat selon la plateforme.
+    Pour Spotify : appelle _robust_recommend avec les genres de l'agent.
+    Pour YouTube / Apple Music : construit une URL de recherche.
+    """
+    emotion   = agent_result.get("emotion_unifiee", "neutral")
+    mp        = agent_result.get("music_params", {})
+    genres    = mp.get("suggested_genres",  [])
+    artists   = mp.get("suggested_artists", [])
+    valence   = mp.get("target_valence",    0.55)
+    energy    = mp.get("target_energy",     0.50)
+    from_fallback = agent_result.get("from_fallback", False)
+
+    base = {
+        "platform":  platform,
+        "label":     emotion,
+        "genres":    genres,
+        "artists":   artists,
+        "turn_id":   turn_id,
+        "xai": {
+            "message_utilisateur":    agent_result.get("message_utilisateur", ""),
+            "bpm_analysis":           agent_result.get("bpm_analysis", ""),
+            "analyse_cognitive_interne": agent_result.get("analyse_cognitive_interne", ""),
+            "valence":                valence,
+            "energy":                 energy,
+            "confidence_score":       agent_result.get("confidence_score", 0.0),
+            "suggested_genres":       genres,
+            "suggested_artists":      artists,
+            "user_bpm":               st.session_state.get("user_bpm", 75),
+            "from_fallback":          from_fallback,
+            "emotion":                emotion,
+        },
+    }
+
+    if platform == "YouTube":
+        base["url"] = _build_platform_url("YouTube", artists, genres)
+        yt_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+        if yt_key:
             try:
-                det = detect_emotion_from_text(corr)
-
-                if isinstance(det, str):
-                    emo = det.lower().strip()
-                    text_res = {"label": emo, "probs": {emo: 1.0}}
-
-                elif isinstance(det, dict):
-                    lbl = (det.get("label") or "").lower().strip() or None
-                    probs = det.get("probs") or {}
-
-                    probs = {
-                        str(k).lower().strip(): float(v)
-                        for k, v in probs.items()
-                        if v is not None
-                    }
-                    s = sum(probs.values()) or 0.0
-                    if s > 0:
-                        probs = {k: v / s for k, v in probs.items()}
-
-                    if not probs and lbl:
-                        probs = {lbl: 1.0}
-
-                    text_res = {"label": lbl, "probs": probs}
-
-            except Exception as e:
-                st.error(f"Erreur analyse texte: {e}")
-                text_res = {"label": None, "probs": {}}
-
-    # --- 3) Fusion (visage + texte) ---
-    fused_label, fused_probs = None, {}
-
-    if face.get("done"):
-        face_label = (face.get("label") or "neutral").lower().strip()
-        face_probs = (face.get("probs") or {}).copy()
-
-        face_probs = {
-            str(k).lower().strip(): float(v)
-            for k, v in face_probs.items()
-            if v is not None
-        }
-        sf = sum(face_probs.values()) or 0.0
-        if sf > 0:
-            face_probs = {k: v / sf for k, v in face_probs.items()}
+                from recommender.youtube_search import search_youtube
+                query = " ".join((artists[:1] or []) + (genres[:2] or [])).strip() or "musique"
+                base["youtube_videos"] = search_youtube(query, yt_key, max_results=3)
+            except Exception:
+                base["youtube_videos"] = []
         else:
-            face_probs = {face_label: 1.0}
+            base["youtube_videos"] = []
+        return base
 
-        text_probs = (text_res.get("probs") or {}).copy()
-        st.session_state["S1_text"] = text_res
+    if platform == "Apple Music":
+        base["url"] = _build_platform_url("Apple Music", artists, genres)
+        return base
 
-        if text_probs:
-            fused_probs, fused_label = fuse(face_probs, text_probs, w_face=0.6)
+    # ── Last.fm ───────────────────────────────────────────────────────────────
+    if platform == "Last.fm":
+        lfm = get_lastfm_client()
+        tracks_lfm: list = []
+        if lfm:
+            try:
+                tracks_lfm = lfm.get_recommendations(emotion, limit=5)
+            except Exception:
+                tracks_lfm = []
+        if tracks_lfm:
+            try:
+                from recommender.itunes_search import get_apple_embed_url_batch
+                get_apple_embed_url_batch(tracks_lfm)
+            except Exception:
+                for t in tracks_lfm:
+                    t.setdefault("embed_url", "")
+        base["tracks_lastfm"] = tracks_lfm
+        return base
 
-            top_txt = max(text_probs, key=text_probs.get)
-            if text_probs[top_txt] >= TEXT_OVERRIDE and top_txt != face_label:
-                fused_label, fused_probs = top_txt, text_probs
-                st.info(f"Émotion ajustée par le texte: {fused_label}")
-            else:
-                st.info(f"Émotion finale (fusion): {fused_label}")
-        else:
-            fused_probs = face_probs
-            fused_label = max(face_probs, key=face_probs.get) if face_probs else face_label
-            st.info(f"Émotion finale: {fused_label}")
+    # ── Spotify ──────────────────────────────────────────────────────────────
+    if not st.session_state.get("spotify_ready") or not spif:
+        base["tracks"] = []
+        return base
 
-    # --- Helper: fallback simple bibliothèque (sans audio_features) ---
-    def _library_simple_pick(sp, limit: int, exclude_uris: set):
-        import random
-        max_fetch = 300
-        items = []
-        try:
-            offset = 0
-            while offset < max_fetch:
-                batch = sp.current_user_saved_tracks(limit=50, offset=offset) or {}
-                page = batch.get("items") or []
-                if not page:
-                    break
-                items.extend(page)
-                offset += 50
-        except Exception:
-            pass
-
-        tracks_local = []
-        for it in items:
-            t = it.get("track") or {}
-            uri = t.get("uri")
-            if uri and uri not in exclude_uris:
-                tracks_local.append(t)
-
-        if not tracks_local:
-            return []
-
-        random.shuffle(tracks_local)
-        return tracks_local[: max(1, limit)]
-
-    # --- 4) Génération de recommandations ---
-    if st.button("Générer 6 titres (S1)", disabled=not face.get("done"), key="gen_s1"):
+    try:
         ensure_seeds(spif)
-        t0 = time.time()
-        limit = 6
+    except Exception:
+        pass
 
-        label_used = (fused_label or face.get("label") or "neutral").lower().strip()
+    seeds = dict(st.session_state.get("seeds", {}))
 
-        tracks = []
-        try:
-            # exclusions minimales
-            s1_prev = set(st.session_state.get("S1_uris", []))
-            disliked = set(st.session_state.get("disliked_uris", set()))
-            hist = st.session_state.get("emotion_history") or {}
-            same_emo_hist = set(hist.get(label_used, set()))  # seulement même émotion
+    # Injection des genres suggérés par l'agent (priorité haute)
+    if genres and not from_fallback:
+        existing = list(seeds.get("genres") or [])
+        for g in genres:
+            if g not in existing:
+                existing.insert(0, g)
+        seeds["genres"] = existing[:5]
 
-            exclude_strict = set()
-            exclude_strict |= s1_prev
-            exclude_strict |= disliked
-            exclude_strict |= same_emo_hist
-
-            exclude_relaxed = set()
-            exclude_relaxed |= s1_prev
-            exclude_relaxed |= disliked  # on garde toujours les dislikes
-
-            if st.session_state.get("lib_only"):
-                # --- Tentative 1: strict ---
-                tracks = recommend_from_library(
-                    spif.sp,
-                    label=label_used,
-                    limit=limit,
-                    exclude_uris=exclude_strict,
-                    profile=(st.session_state["seeds"].get("profile") or {}),
-                )
-
-                # --- Tentative 2: relâchée ---
-                if len(tracks) < limit:
-                    more = recommend_from_library(
-                        spif.sp,
-                        label=label_used,
-                        limit=limit,
-                        exclude_uris=exclude_relaxed,
-                        profile=(st.session_state["seeds"].get("profile") or {}),
-                    )
-                    if len(more) > len(tracks):
-                        tracks = more
-
-                # --- Tentative 3: simple pick (sans audio_features) ---
-                if len(tracks) < limit:
-                    simple = _library_simple_pick(spif.sp, limit=limit, exclude_uris=exclude_relaxed)
-                    if len(simple) > len(tracks):
-                        tracks = simple
-
-                # --- Tentative 4: si bibliothèque insuffisante -> recos publiques ---
-                if len(tracks) < limit:
-                    st.info("Bibliothèque insuffisante → bascule automatique vers recommandations publiques.")
-                    seeds_used = dict(st.session_state["seeds"])
-                    seeds_used["profile"] = clean_profile(seeds_used.get("profile"), label_used)
-                    seeds_used = _sanitize_and_shorten_seeds(seeds_used, label_used)
-
-                    prof = dict(seeds_used.get("profile") or {})
-                    prof.pop("mean_tempo", None)
-                    seeds_used["profile"] = {
-                        "mean_valence": prof.get("mean_valence"),
-                        "mean_energy": prof.get("mean_energy"),
-                    }
-                    tracks = _robust_recommend(spif, label_used, seeds_used, limit, exclude_relaxed)
-
-                # rerank perso (ne doit jamais vider la liste)
-                if tracks:
-                    tracks = _rerank_tracks_personalized(tracks, label_used, spif.sp)[:limit]
-
-            else:
-                seeds_used = dict(st.session_state["seeds"])
-                seeds_used["profile"] = clean_profile(seeds_used.get("profile"), label_used)
-                seeds_used = _sanitize_and_shorten_seeds(seeds_used, label_used)
-
-                prof = dict(seeds_used.get("profile") or {})
-                prof.pop("mean_tempo", None)
-                seeds_used["profile"] = {
-                    "mean_valence": prof.get("mean_valence"),
-                    "mean_energy": prof.get("mean_energy"),
-                }
-
-                exclude_sp = set()
-                exclude_sp |= s1_prev
-                exclude_sp |= disliked
-                exclude_sp |= same_emo_hist
-
-                tracks = _robust_recommend(spif, label_used, seeds_used, limit, exclude_sp)
-
-            # --- apprentissage feedback / filtrage dislikes / reranking final ---
-            pre_fb = list(tracks or [])
-            stats = st.session_state.get("fb_stats") or {}
-            tracks = rerank_tracks_with_feedback(tracks or [], label_used, stats, top_k=limit)
-
-            # si rerank a trop filtré, on complète avec le reste
-            if len(tracks) < limit and pre_fb:
-                seen = {t.get("uri") for t in tracks if t.get("uri")}
-                for t in pre_fb:
-                    uri = t.get("uri")
-                    if uri and uri not in seen:
-                        tracks.append(t)
-                        seen.add(uri)
-                    if len(tracks) >= limit:
-                        break
-
-        except Exception as e:
-            st.session_state.setdefault("api_err", set()).add(str(e))
-            tracks = []
-
-        # --- sauvegarde session ---
-        st.session_state["last_gen_ms"] = int((time.time() - t0) * 1000)
-        st.session_state["S1_tracks"] = tracks
-        st.session_state["S1_face"] = face
-        st.session_state["S1_label"] = label_used
-        st.session_state["S1_uris"] = [t.get("uri") for t in tracks if t.get("uri")]
-
-        st.session_state.setdefault("emotion_history", {})
-        st.session_state["emotion_history"].setdefault(label_used, set()).update(st.session_state["S1_uris"])
-
-    # --- 5) Affichage + feedback/log UI ---
-    if "S1_tracks" in st.session_state:
-        playback_and_log_ui(
-            pid,
-            "S1",
-            st.session_state["S1_face"],
-            st.session_state.get("S1_text", {"label": None, "probs": {}}),
-            st.session_state["S1_label"],
-            st.session_state["S1_tracks"],
-            spif,
-        )
-
-
-def _norm(s: str) -> str:
-    if not s: return ""
-    s = s.strip().lower()
-    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-    return s
-
-VAL_POS = {"heureux","joyeux","bien","bien!","motivé","motive","content","contente","cool"}
-VAL_NEG = {"triste","sombre","deprime","deprimé","deprimee","pas bien","mal","fatigue","fatiguee","fatigué","fatiguée"}
-ENER_LOW = {"calme","fatigue","fatiguee","lent","repos","tranquille","faible"}
-ENER_HIGH = {"elevee","élevée","haute","forte","intense","energie","énergie","excite","excitee","excité","excitee"}
-
-def answers_to_valence_energy(answers: list[str]) -> dict:
-    v_hits = e_hits = 0
-    v = e = 0.5
-    for raw in answers:
-        t = _norm(str(raw))
-        if t.isdigit():
-            n = int(t)
-            if 0 <= n <= 10:
-                e = n / 10 if n > e else e
-                continue
-        if t in {"oui","yes","y"}: v = max(v, 0.7)
-        if t in {"non","no","n"}: v = min(v, 0.4)
-        if any(k in t for k in VAL_POS): v_hits += 1
-        if any(k in t for k in VAL_NEG): v_hits -= 1
-        if any(k in t for k in ENER_HIGH): e_hits += 1
-        if any(k in t for k in ENER_LOW): e_hits -= 1
-    v = min(max(0.5 + 0.15 * v_hits, 0.0), 1.0)
-    e = min(max(e + 0.15 * e_hits, 0.0), 1.0)
-    return {"mean_valence": round(v, 2), "mean_energy": round(e, 2)}
-
-def scenario_s2(spif: SpotifyInterface, pid: str):
-    from datetime import datetime
-
-    # 1) Mesure faciale auto (pas de validation manuelle dans S2)
-    face = face_local_video_7s("s2", manual_validate=False)
-
-    st.subheader("Chat guidé (S2)")
-    prompts = [
-        "Décrivez votre état émotionnel en quelques mots.",
-        "Vous préférez une ambiance plutôt énergique ou calme ?",
-        "Vous voulez quelque chose de lumineux ou plutôt sombre ?",
-        "Votre niveau de stress récent (faible / moyen / élevé) ?",
-        "Vous préférez paroles ou instrumental ?",
-        "Un genre que vous voulez éviter ?",
-        "Niveau d'énergie (0-10) ?",
-    ]
-
-    # 2) Mémoire de chat : on stocke désormais Question+Réponse (et timestamp)
-    st.session_state.setdefault("S2_chat", [])
-
-    # ✅ Compatibilité si S2_chat était une ancienne liste de strings ["rep1","rep2",...]
-    if st.session_state["S2_chat"] and isinstance(st.session_state["S2_chat"][0], str):
-        old = st.session_state["S2_chat"]
-        st.session_state["S2_chat"] = []
-        for i, a in enumerate(old):
-            q = prompts[i] if i < len(prompts) else f"Question {i+1}"
-            st.session_state["S2_chat"].append({
-                "q": q,
-                "a": a,
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-
-    # 3) UI chat : on ajoute une réponse à la fois via form
-    if face.get("done"):
-        with st.form("s2_form", clear_on_submit=True):
-            idx = len(st.session_state["S2_chat"])
-
-            if idx < len(prompts):
-                current_q = prompts[idx]
-                st.write(f"**Q{idx+1} — {current_q}**")
-                ans = st.text_input("Votre réponse", key=f"s2_ans_{idx}")
-                submitted = st.form_submit_button("Ajouter")
-
-                if submitted:
-                    if ans.strip():
-                        st.session_state["S2_chat"].append({
-                            "q": current_q,
-                            "a": ans.strip(),
-                            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                        st.rerun()
-                    else:
-                        st.warning("Réponse vide : écrivez une réponse avant d’ajouter 🙂")
-            else:
-                st.success("✅ Questions terminées. Vous pouvez générer la playlist.")
-                st.form_submit_button("OK")
-    else:
-        st.info("Mesure faciale en cours…")
-
-    # ✅ Historique (questions + réponses) pour crédibilité / rapport
-    if st.session_state["S2_chat"]:
-        st.caption("Historique (questions/réponses) :")
-        for i, turn in enumerate(st.session_state["S2_chat"], 1):
-            st.markdown(f"**Q{i}.** {turn.get('q','')}")
-            st.markdown(f"➡️ **R{i}.** {turn.get('a','')}")
-            if turn.get("ts"):
-                st.caption(f"⏱️ {turn['ts']}")
-            st.divider()
-
-    # Préparer la liste des réponses (utile pour NLP + prefs + min réponses)
-    answers = [t.get("a", "").strip() for t in st.session_state["S2_chat"] if t.get("a")]
-    answers = [a for a in answers if a]  # nettoyer
-
-    # 4) Calcul des probabilités textuelles agrégées
-    text_probs = {}
-    if answers:
-        try:
-            joined = " | ".join(answers)
-            agg = emotion_distribution(joined)  # retourne dict emotions -> scores
-            if isinstance(agg, dict):
-                text_probs = {
-                    k.lower(): float(v)
-                    for k, v in agg.items()
-                    if isinstance(v, (int, float))
-                }
-                s = sum(text_probs.values()) or 0.0
-                if s > 0:
-                    text_probs = {k: v / s for k, v in text_probs.items()}
-        except Exception:
-            text_probs = {}
-
-    # 5) Fusion Face + Texte (et override si texte très fort)
-    final_label = None
-    fused_probs = {}
-
-    TEXT_OVERRIDE = 0.65  # si le texte est très confiant, on peut corriger
-
-    if face.get("done"):
-        face_probs = (face.get("probs") or {}).copy()
-        sf = sum(face_probs.values()) or 0.0
-        if sf > 0:
-            face_probs = {k.lower(): float(v) / sf for k, v in face_probs.items()}
-
-        if text_probs:
-            fused_probs, fused_label = fuse(face_probs, text_probs, w_face=0.55)
-
-            top_txt = max(text_probs, key=text_probs.get)
-            if text_probs[top_txt] >= TEXT_OVERRIDE and top_txt != (face.get("label") or "neutral"):
-                final_label = top_txt
-                fused_probs = text_probs
-                st.info(f"Émotion ajustée par le texte: **{final_label}**")
-            else:
-                final_label = fused_label
-                st.info(f"Émotion finale (fusion): **{final_label}**")
-        else:
-            final_label = face.get("label") or "neutral"
-            fused_probs = face_probs
-            st.info(f"Émotion finale (visage): **{final_label}**")
-
-    # Sauvegarde utile
-    st.session_state["S2_face"] = face
-    st.session_state["S2_text"] = {"label": None, "probs": fused_probs or {}}
-    st.session_state["S2_label"] = final_label or (face.get("label") if face.get("done") else None)
-
-    # 6) Préférences dérivées du texte (optionnel)
-    derived = derive_s2_preferences(answers)
-    if any(v is not None for v in derived.values()):
-        st.caption(f"Préférences dérivées: {derived}")
-
-    # 7) Génération : on impose un minimum de réponses (évite résultats pauvres)
-    can_gen = face.get("done") and len(answers) >= 5
-
-    if st.button("Générer 6 titres (S2)", disabled=not can_gen, key="gen_s2"):
-        ensure_seeds(spif)
-        t0 = time.time()
-
-        label_used = (final_label or face.get("label") or "neutral").lower()
-
-        try:
-            # exclusions: déjà vus + dislikes + historique par émotion
-            exclude = set(st.session_state.get("S2_uris", []))
-            exclude |= set(st.session_state.get("S1_uris", []))
-            if st.session_state.get("emotion_history"):
-                exclude |= set().union(*st.session_state["emotion_history"].values())
-            exclude |= st.session_state.get("disliked_uris", set())
-
-            if st.session_state.get("lib_only"):
-                tracks = recommend_from_library(
-                    spif.sp, label=label_used, limit=6,
-                    exclude_uris=exclude,
-                    profile=(st.session_state["seeds"].get("profile") or {})
-                )
-                tracks = _rerank_tracks_personalized(tracks, label_used, spif.sp)[:6]
-            else:
-                seeds_mod = dict(st.session_state["seeds"])
-                prof = dict(seeds_mod.get("profile") or {})
-
-                # injecter derived si dispo
-                if derived.get("mean_energy") is not None:
-                    prof["mean_energy"] = derived["mean_energy"]
-                if derived.get("mean_valence") is not None:
-                    prof["mean_valence"] = derived["mean_valence"]
-
-                seeds_mod["profile"] = clean_profile(prof, label_used)
-                seeds_mod = _sanitize_and_shorten_seeds(seeds_mod, label_used)
-
-                # éviter mean_tempo si ça te casse parfois
-                prof2 = dict(seeds_mod.get("profile") or {})
-                prof2.pop("mean_tempo", None)
-                seeds_mod["profile"] = {
-                    "mean_valence": prof2.get("mean_valence"),
-                    "mean_energy": prof2.get("mean_energy"),
-                }
-
-                tracks = _robust_recommend(spif, label_used, seeds_mod, limit=6, exclude_uris=exclude)
-
-            # ✅ AJOUT apprentissage feedback / reranking
-            stats = st.session_state.get("fb_stats") or {}
-            tracks = rerank_tracks_with_feedback(tracks, label_used, stats, top_k=6)
-
-        except Exception as e:
-            st.session_state["api_err"].add(str(e))
-            tracks = []
-
-        st.session_state["last_gen_ms"] = int((time.time() - t0) * 1000)
-        st.session_state["S2_tracks"] = tracks
-        st.session_state["S2_uris"] = [t.get("uri") for t in tracks if t.get("uri")]
-
-        if label_used:
-            st.session_state["emotion_history"].setdefault(label_used, set()).update(st.session_state["S2_uris"])
-
-    # 8) Affichage + logging feedback
-    if "S2_tracks" in st.session_state:
-        playback_and_log_ui(
-            pid, "S2",
-            st.session_state.get("S2_face", {"label": None, "probs": {}}),
-            st.session_state.get("S2_text", {"label": None, "probs": {}}),
-            st.session_state.get("S2_label") or "neutral",
-            st.session_state["S2_tracks"],
-            spif
-        )
-
-def _main_app():
-    st.divider()
-    if st.session_state.get("spotify_ready"):
-        st.success("Spotify prêt.")
-    else:
-        st.info("Pas encore connecté à Spotify.")
-    miss = st.session_state.get("missing_scopes") or []
-    
-    if not st.session_state.get("spotify_ready"):
-        return
-    st.session_state.setdefault("lib_only", False)
-    st.session_state["lib_only"] = st.checkbox(
-        "Limiter aux titres de ma bibliothèque",
-        value=st.session_state["lib_only"],
-        key="lib_only_global",
+    seeds["profile"] = clean_profile(
+        {"mean_valence": valence, "mean_energy": energy}, emotion
     )
-    scenario = st.radio("Scénario", ["S1 — Fusion rapide", "S2 — Chat guidé"], horizontal=True, key="scenario_main")
-    spif = st.session_state.get("spif"); pid = st.session_state.get("pid", "")
-    if scenario.startswith("S1"):
-        scenario_s1(spif, pid)
-    else:
-        scenario_s2(spif, pid)
-    with st.expander("Diagnostics"):
-        st.write("Historique émotions:", {k: len(v) for k, v in (st.session_state.get("emotion_history") or {}).items()})
-        if st.session_state.get("api_err"):
-            for e in sorted(st.session_state["api_err"]):
-                st.write("•", e)
-        st.write("Cache features:", len(st.session_state.get("af_cache_by_id", {})),
-                 "| Fails:", len(st.session_state.get("af_fail_ids", set())),
-                 "| Block:", st.session_state.get("block_spotify_features"))
-        if "seeds" in st.session_state:
-            st.json(st.session_state["seeds"])
+    seeds = _sanitize_and_shorten_seeds(seeds, emotion)
+    prof  = dict(seeds.get("profile") or {})
+    prof.pop("mean_tempo", None)
+    seeds["profile"] = {
+        "mean_valence": prof.get("mean_valence"),
+        "mean_energy":  prof.get("mean_energy"),
+    }
 
-def _connection_ui():
-    st.subheader("Connexion / Participant")
-    col1, col2, col3 = st.columns([2, 1.2, 1])
-    with col1:
-        pid = st.text_input("Participant ID", value=st.session_state.get("pid", ""), key="pid_input_main")
-        if pid: st.session_state["pid"] = pid
-    with col2:
-        st.selectbox("Market", ["FR","US","GB","DE","ES","IT","CA"], index=0, key="market_select_main")
-    with col3:
-        if st.button("Reset session", key="reset_btn"):
-            reset_session()
-    cA, cB = st.columns(2)
-    with cA:
-        if st.button("Connexion Spotify / Seeds", key="connect_btn_main"):
-            if st.session_state.get("pid"):
-                spif = get_sp_client(st.session_state["pid"])
-                st.session_state["spif"] = spif
-                set_sp_global(spif.sp)
-                set_cache_salt(st.session_state["pid"])
-                try:
-                    me = spif.sp.current_user()
-                    miss = spif.missing_scopes(REQUIRED_SCOPES) or []
-                    st.session_state["missing_scopes"] = miss
-                    st.session_state["spotify_ready"] = True
-                    st.success(f"Connecté: {me.get('display_name')} ({me.get('id')})")
-                    if miss:
-                        st.warning("Scopes manquants: " + ", ".join(miss))
-                        manual_auth_ui(spif, key_prefix="auth_missing_inline")
-                    else:
-                        ensure_seeds(spif)
-                except Exception as e:
-                    st.session_state["spotify_ready"] = False
-                    st.session_state["missing_scopes"] = []
-                    st.error(f"Erreur OAuth: {e}")
-                    manual_auth_ui(spif, key_prefix="auth_error_inline")
+    exclude = (
+        st.session_state.get("disliked_uris", set())
+        | set(st.session_state.get("chat_track_uris", []))
+    )
+    limit  = 6
+    tracks = _robust_recommend(spif, emotion, seeds, limit, exclude)
+
+    # Apprentissage feedback
+    stats  = st.session_state.get("fb_stats") or {}
+    tracks = rerank_tracks_with_feedback(tracks, emotion, stats, top_k=limit)
+
+    # Mémorisation des URIs pour éviter les répétitions
+    new_uris = [t.get("uri") for t in tracks if t.get("uri")]
+    st.session_state.setdefault("chat_track_uris", [])
+    st.session_state["chat_track_uris"].extend(new_uris)
+
+    base["tracks"] = tracks
+    return base
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sidebar V3 — caméra + signaux + connexion
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sidebar_ui():
+    with st.sidebar:
+        # ── En-tête Cyber Violet ──────────────────────────────────────────────
+        st.markdown(
+            "<div style='text-align:center; padding:10px 0;'>"
+            "<span class='sidebar-logo'>FACE²MELODY</span><br>"
+            "<span class='sidebar-subtitle'>V3 · Compagnon Émotionnel IA · UQAM</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.divider()
+
+        # ── Vue ───────────────────────────────────────────────────────────────
+        view = st.radio("Vue", ["Expérience", "Analytics"], index=0, key="view_mode",
+                        horizontal=True)
+
+        st.divider()
+
+        if st.session_state.get("view_mode") != "Expérience":
+            return
+
+        # ── Plateforme musicale ───────────────────────────────────────────────
+        st.markdown("### 🎵 Plateforme")
+        st.selectbox(
+            "Cible de recommandation",
+            ["Last.fm", "Spotify", "YouTube", "Apple Music"],
+            key="platform",
+            help=(
+                "Last.fm : recommandations gratuites sans Premium. "
+                "Spotify : API complète (Premium requis). "
+                "YouTube / Apple Music : liens de recherche directs."
+            ),
+        )
+        # Connexion Last.fm (si plateforme sélectionnée)
+        if st.session_state.get("platform") == "Last.fm":
+            lfm_key = os.getenv("LASTFM_API_KEY", "").strip()
+            if not lfm_key:
+                st.warning(
+                    "Clé Last.fm manquante dans `.env`. "
+                    "Créez une app sur last.fm/api/account/create"
+                )
             else:
-                st.warning("Renseignez un Participant ID.")
-    with cB:
-        if st.button("Purger caches", key="purge_btn_main"):
-            n = purge_all_cache()
-            st.info(f"Caches supprimés: {n}. Reconnectez-vous si nécessaire.")
-    if not st.session_state.get("spotify_ready"):
-        st.caption("Connectez-vous pour afficher les scénarios.")
-    else:
-        st.caption("Connexion Spotify active.")
+                st.text_input(
+                    "Nom d'utilisateur Last.fm (optionnel)",
+                    key="lastfm_username",
+                    placeholder="ex: votre_pseudo",
+                    help="Laissez vide pour des recommandations anonymes par tags émotionnels.",
+                )
+                lfm = get_lastfm_client()
+                if lfm:
+                    if st.session_state.get("lastfm_username"):
+                        st.success(f"✓ Last.fm : {st.session_state['lastfm_username']}")
+                    else:
+                        st.caption("🎵 Mode anonyme — recommandations par émotion")
+
+        st.divider()
+
+        # ── BPM simulé ────────────────────────────────────────────────────────
+        st.markdown("### 💓 Physiologie")
+        bpm = st.slider(
+            "Rythme cardiaque simulé (BPM)",
+            min_value=40, max_value=160, value=75, step=1,
+            key="user_bpm",
+            help="Signal physiologique pour la fusion trimodale V3. BPM > 100 + visage neutre = anxiété détectée.",
+        )
+        # Waveform animée + feedback coloré
+        if bpm > 120:
+            bpm_color = "#ef4444"; bpm_label = "stress aigu possible"
+        elif bpm > 100:
+            bpm_color = "#f97316"; bpm_label = "anxiété latente suspectée"
+        elif bpm >= 80:
+            bpm_color = "#10b981"; bpm_label = "état équilibré"
+        elif bpm >= 60:
+            bpm_color = "#3b82f6"; bpm_label = "calme physiologique"
+        else:
+            bpm_color = "#8b5cf6"; bpm_label = "fatigue ou mélancolie"
+        bars = "".join(
+            f'<div class="bpm-bar" style="background:{bpm_color};'
+            f'animation-duration:{max(0.3, 0.8 - (bpm-40)/200):.2f}s;"></div>'
+            for _ in range(7)
+        )
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;">'
+            f'<div class="bpm-waveform">{bars}</div>'
+            f'<span style="color:{bpm_color};font-size:0.78rem;font-weight:600;">'
+            f'{bpm_label}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+
+        # ── Caméra temps réel ─────────────────────────────────────────────────
+        st.markdown("### 📷 Flux Vidéo (Vision)")
+
+        cam_running = _CAM_STATE["running"]
+        c_btn1, c_btn2 = st.columns(2)
+        with c_btn1:
+            if not cam_running:
+                if st.button("▶ Démarrer", key="start_cam", use_container_width=True):
+                    start_camera()
+                    st.rerun()
+            else:
+                if st.button("⏹ Arrêter", key="stop_cam", use_container_width=True):
+                    stop_camera()
+                    st.rerun()
+        with c_btn2:
+            if cam_running and st.button("🔄 Rafraîchir", key="refresh_cam", use_container_width=True):
+                st.rerun()
+
+        # Affichage live (fragment auto-refresh 0.5s)
+        _camera_live_fragment()
+
+        if cam_running:
+            cam_status = get_camera_status_v3()
+            status_map = {
+                "ok":          "🟢 Signal facial fiable",
+                "low_light":   "🟡 Faible luminosité — poids texte augmenté",
+                "unavailable": "🔴 Visage non détecté",
+            }
+            st.caption(status_map.get(cam_status, cam_status))
+
+        st.divider()
+
+        # ── Auth section — conditionnel selon la plateforme ──────────────────
+        _platform = st.session_state.get("platform", "Spotify")
+
+        if _platform == "Spotify":
+            st.markdown("### 🎧 Connexion Spotify")
+
+            pid = st.text_input(
+                "Participant ID",
+                value=st.session_state.get("pid", ""),
+                key="pid_input_sidebar",
+                placeholder="ex: P001",
+            )
+            if pid:
+                st.session_state["pid"] = pid
+
+            st.selectbox("Market", ["FR","US","GB","DE","ES","IT","CA"],
+                         index=0, key="market_select_sidebar")
+
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                if st.button("Connexion", key="connect_btn_sidebar", use_container_width=True):
+                    if st.session_state.get("pid"):
+                        spif = get_sp_client(st.session_state["pid"])
+                        st.session_state["spif"] = spif
+                        set_sp_global(spif.sp)
+                        set_cache_salt(st.session_state["pid"])
+                        try:
+                            me   = spif.sp.current_user()
+                            miss = spif.missing_scopes(REQUIRED_SCOPES) or []
+                            st.session_state["missing_scopes"]  = miss
+                            st.session_state["spotify_ready"]   = True
+                            st.success(f"✓ {me.get('display_name', 'Connecté')}")
+                            if not miss:
+                                ensure_seeds(spif)
+                        except Exception as e:
+                            st.session_state["spotify_ready"]  = False
+                            st.error(f"OAuth : {e}")
+                            manual_auth_ui(spif, key_prefix="sidebar_auth")
+                    else:
+                        st.warning("Renseignez un Participant ID.")
+            with col_s2:
+                if st.button("Reset", key="reset_sidebar", use_container_width=True):
+                    reset_session()
+
+            if st.session_state.get("spotify_ready"):
+                st.success("Spotify connecté")
+            else:
+                st.caption("Non connecté à Spotify.")
+
+        elif _platform == "YouTube":
+            st.markdown("### ▶️ YouTube")
+            yt_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+            if yt_key:
+                st.caption("✓ YOUTUBE_API_KEY détectée — embed vidéo activé")
+            else:
+                st.caption("Sans clé API : liens de recherche uniquement.  \n"
+                           "Ajoutez `YOUTUBE_API_KEY` dans `.env` pour les embeds.")
+
+        elif _platform == "Apple Music":
+            st.markdown("### 🍎 Apple Music")
+            st.caption("Lecture via iTunes embed — aucune clé API requise.")
+
+        # Last.fm : UI déjà gérée dans la section plateforme ci-dessus
+
+        st.divider()
+
+        # ── Diagnostics compact ───────────────────────────────────────────────
+        with st.expander("Diagnostics"):
+            st.caption(f"Détection: {get_status()} | Backend: {get_backend()}")
+            st.caption(f"Cache feats: {len(st.session_state.get('af_cache_by_id', {}))}")
+            if st.session_state.get("api_err"):
+                for e in sorted(st.session_state["api_err"])[:3]:
+                    st.caption(f"• {e}")
+            if st.button("Purger caches", key="purge_sidebar"):
+                n = purge_all_cache()
+                st.info(f"{n} caches supprimés.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Interface chat principale — V3 Affective Companion
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _chat_ui():
+    """Interface conversationnelle principale — Fusion Trimode V3."""
+    from agent_logic import process_multimodal_emotions
+
+    spif = st.session_state.get("spif")
+    pid  = st.session_state.get("pid", "")
+    _fb_reload(pid)
+
+    # ── Injection CSS + Fonts (Cyber Violet) ────────────────────────────────
+    st.markdown(_FONTS, unsafe_allow_html=True)
+    st.markdown(_CSS,   unsafe_allow_html=True)
+
+    # ── En-tête principal ────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="f2m-title">FACE²MELODY</div>'
+        '<div class="f2m-subtitle">V3 · Compagnon Émotionnel IA · M.Sc. UQAM · Chapitre 6</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Métriques live ───────────────────────────────────────────────────────
+    platform = st.session_state.get("platform", "Last.fm")
+    bpm_val  = st.session_state.get("user_bpm", 75)
+    cam_ok   = _CAM_STATE["running"] and _CAM_STATE["faces_seen"]
+
+    with _CAM_LOCK:
+        detected_emotion = _CAM_STATE.get("label", "neutral")
+    emo_color = _EMOTION_COLORS.get(detected_emotion, "#8b5cf6")
+
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        st.markdown(
+            f'<div class="metric-cyber">'
+            f'<div class="value">{platform}</div>'
+            f'<div class="label">Plateforme</div></div>',
+            unsafe_allow_html=True,
+        )
+    with h2:
+        bpm_icon = "🔴" if bpm_val > 100 else ("🟢" if bpm_val >= 60 else "🔵")
+        st.markdown(
+            f'<div class="metric-cyber">'
+            f'<div class="value">{bpm_icon} {bpm_val}</div>'
+            f'<div class="label">BPM</div></div>',
+            unsafe_allow_html=True,
+        )
+    with h3:
+        st.markdown(
+            f'<div class="metric-cyber">'
+            f'<div class="value">{"🟢 ON" if cam_ok else "⚫ OFF"}</div>'
+            f'<div class="label">Caméra</div></div>',
+            unsafe_allow_html=True,
+        )
+    with h4:
+        st.markdown(
+            f'<div class="metric-cyber">'
+            f'<div class="value" style="color:{emo_color};">'
+            f'{detected_emotion.upper()}</div>'
+            f'<div class="label">Émotion</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # ── Initialisation de l'historique chat ──────────────────────────────────
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = [
+            {
+                "role":    "assistant",
+                "content": "Bonjour Mohamed, comment vous sentez-vous aujourd'hui ?",
+                "type":    "greeting",
+            }
+        ]
+    if "chat_turn_id" not in st.session_state:
+        st.session_state["chat_turn_id"] = 0
+
+    # ── Affichage de l'historique ─────────────────────────────────────────────
+    for msg in st.session_state["chat_history"]:
+        if msg["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(msg["content"])
+        else:
+            with st.chat_message("assistant"):
+                st.markdown(msg["content"])
+            # Composant XAI (si disponible)
+            if msg.get("xai_data"):
+                _render_xai_expander(msg["xai_data"])
+            # Recommandations musicales (si disponibles)
+            if msg.get("music_data"):
+                _render_music_block(msg["music_data"], spif, pid)
+
+    # ── Entrée utilisateur ────────────────────────────────────────────────────
+    user_input = st.chat_input(
+        "Comment vous sentez-vous ? Décrivez votre état en quelques mots…"
+    )
+
+    if not user_input:
+        if not st.session_state.get("spotify_ready") and platform == "Spotify":
+            st.info(
+                "Connectez-vous à Spotify dans la barre latérale pour recevoir "
+                "des recommandations personnalisées, ou choisissez YouTube / Apple Music."
+            )
+        return
+
+    # ── Traitement du message ─────────────────────────────────────────────────
+    # 1. Ajout du message utilisateur
+    st.session_state["chat_history"].append({
+        "role":    "user",
+        "content": user_input,
+    })
+
+    # 2. Capture des signaux trimodaux
+    face_probs     = get_face_probs()
+    user_bpm       = st.session_state.get("user_bpm", 75)
+    camera_status  = get_camera_status_v3()
+
+    # 3. Appel agent V3 — Fusion Trimode (Vision + Texte + BPM)
+    with st.spinner("🧠 Analyse trimodale en cours (Vision · Texte · BPM)…"):
+        try:
+            agent_result = process_multimodal_emotions(
+                face_probs    = face_probs,
+                user_text     = user_input,
+                user_bpm      = user_bpm,
+                camera_status = camera_status,
+            )
+        except Exception as exc:
+            logger.error("process_multimodal_emotions a échoué : %s", exc)
+            agent_result = {
+                "emotion_unifiee":           "neutral",
+                "bpm_analysis":              "Analyse indisponible.",
+                "analyse_cognitive_interne": f"Erreur : {exc}",
+                "message_utilisateur":       "Je rencontre une difficulté technique. Réessayez dans un instant.",
+                "confidence_score":          0.0,
+                "music_params": {
+                    "target_valence":    0.55,
+                    "target_energy":     0.50,
+                    "suggested_artists": [],
+                    "suggested_genres":  ["pop","indie","lo-fi"],
+                },
+                "from_fallback": True,
+            }
+
+    # 4. Génération musicale selon la plateforme
+    turn_id = st.session_state["chat_turn_id"]
+    st.session_state["chat_turn_id"] += 1
+
+    with st.spinner(f"🎵 Génération des recommandations {platform}…"):
+        music_data = _generate_music_data(agent_result, spif, pid, platform, turn_id)
+
+    # 5. Construction du message assistant
+    assistant_content = agent_result.get("message_utilisateur") or (
+        f"J'ai détecté une émotion **{agent_result.get('emotion_unifiee','—')}**. "
+        "Voici ce que je vous propose."
+    )
+
+    # Ajout de l'émotion en gras si pas déjà mentionnée
+    emotion_cap = agent_result.get("emotion_unifiee", "neutral").capitalize()
+    if emotion_cap.lower() not in assistant_content.lower():
+        assistant_content = f"**{emotion_cap} détecté** · {assistant_content}"
+
+    xai_data = {
+        "bpm_analysis":            agent_result.get("bpm_analysis", ""),
+        "analyse_cognitive_interne": agent_result.get("analyse_cognitive_interne", ""),
+        "confidence_score":        agent_result.get("confidence_score", 0.0),
+        "valence":                 agent_result.get("music_params", {}).get("target_valence", 0.55),
+        "energy":                  agent_result.get("music_params", {}).get("target_energy",  0.50),
+        "suggested_genres":        agent_result.get("music_params", {}).get("suggested_genres",  []),
+        "suggested_artists":       agent_result.get("music_params", {}).get("suggested_artists", []),
+        "emotion":                 agent_result.get("emotion_unifiee", "neutral"),
+        "user_bpm":                user_bpm,
+        "from_fallback":           agent_result.get("from_fallback", False),
+    }
+
+    st.session_state["chat_history"].append({
+        "role":       "assistant",
+        "content":    assistant_content,
+        "type":       "response",
+        "xai_data":   xai_data,
+        "music_data": music_data,
+    })
+
+    # Mise à jour de l'historique émotionnel (pour déduplication Spotify)
+    label_emo = agent_result.get("emotion_unifiee", "neutral")
+    new_uris  = [t.get("uri") for t in music_data.get("tracks", []) if t.get("uri")]
+    st.session_state.setdefault("emotion_history", {})
+    st.session_state["emotion_history"].setdefault(label_emo, set()).update(new_uris)
+
+    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Point d'entrée principal
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run_app():
     try:
         normalize_redirect_uri()
     except Exception:
         pass
-    _connection_ui()
-    _main_app()
+
+    _sidebar_ui()
+
+    # Vue Analytics
+    if st.session_state.get("view_mode") == "Analytics":
+        if analytics_render:
+            try:
+                analytics_render()
+            except Exception as e:
+                st.error("Erreur dans la page Analytics.")
+                st.exception(e)
+        else:
+            st.error(
+                "Module analytics_gen introuvable. "
+                "Lancez `streamlit run analytics_gen.py` pour l'utiliser en autonome."
+            )
+        return
+
+    # Vue Expérience — interface chat V3
+    _chat_ui()
+
 
 run_app()

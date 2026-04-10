@@ -14,6 +14,8 @@ requests>=2.25.1  # Pour les requêtes HTTP (si utilisé)
 pandas>=1.3.0  # Pour la manipulation des données (si utilisé)
 numpy>=1.21.0,<2.0.0  # verrou pour compat DeepFace
 python-dotenv>=1.0.0
+anthropic>=0.30.0  # V2 : agent cognitif LLM (Chapitre 6)
+pylast>=5.1.0      # Last.fm API : recommandations musicales gratuites (sans Premium)
 watchdog>=4.0.0  # Optionnel: améliore le rechargement Streamlit local
 urllib3<2.0.0  # Optionnel: supprimer l'avertissement LibreSSL (ou mettre à jour Python/OpenSSL)
 opencv-python>=4.8.0  # Utiliser version non headless pour accès caméra local (headless pour déploiement serveur)
