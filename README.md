@@ -1,17 +1,19 @@
-# Face2Melody V3 — Compagnon Émotionnel par IA Affective
+<div align="center">
 
-> Projet de recherche M.Sc. Intelligence Artificielle — UQAM  
-> Système multimodal de détection émotionnelle et recommandation musicale en temps réel
+![Face2Melody Banner](assets/banner.svg)
 
-![Python](https://img.shields.io/badge/Python-3.9--3.11-blue)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.35+-red)
-![Claude API](https://img.shields.io/badge/Claude-Sonnet%204.6-orange)
-![Last.fm](https://img.shields.io/badge/Last.fm-API-darkred)
-![License](https://img.shields.io/badge/License-Academic-green)
+![Python](https://img.shields.io/badge/Python-3.9--3.11-blue?style=flat-square&logo=python)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.35+-red?style=flat-square&logo=streamlit)
+![Claude](https://img.shields.io/badge/Claude-Sonnet%204.6-orange?style=flat-square)
+![Last.fm](https://img.shields.io/badge/Last.fm-API-darkred?style=flat-square&logo=lastdotfm)
+![License](https://img.shields.io/badge/License-Academic-green?style=flat-square)
+![Branch](https://img.shields.io/badge/Branch-v3%20Trimode-purple?style=flat-square)
+
+</div>
 
 ---
 
-## 🆕 Nouveautés V3 — Fusion Trimode & Agnosticisme Plateforme
+## Nouveautés V3 — Fusion Trimode & Agnosticisme Plateforme
 
 | Fonctionnalité | V1/V2 | V3 |
 |---|---|---|
@@ -28,121 +30,112 @@
 
 **Face2Melody** est passé d'un outil de recommandation musicale à un **Compagnon Émotionnel**. Il détecte l'état affectif de l'utilisateur via trois modalités complémentaires et génère des recommandations musicales adaptées sur plusieurs plateformes, avec une justification XAI empathique en français.
 
-### Question de recherche
-
 > *La fusion trimodale (vision + texte + physiologie) améliore-t-elle la pertinence perçue des recommandations musicales par rapport aux approches bimodales ou heuristiques ?*
 
 ---
 
-## Architecture V3 — Fusion Trimode (Late Fusion)
+## Architecture Système
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     Streamlit Chat Interface                      │
-│                    (st.chat_message — app.py)                    │
-└──────────┬───────────────────┬──────────────────┬────────────────┘
-           │                   │                  │
-   ┌───────▼──────┐   ┌────────▼───────┐  ┌──────▼───────┐
-   │  Vision      │   │  Texte (NLP)   │  │  Physiologie  │
-   │  VGG-Face    │   │  Analyse       │  │  BPM (réel   │
-   │  DeepFace    │   │  sémantique    │  │  ou simulé)  │
-   │  7 → 4 cls   │   │  & tonale FR   │  └──────┬───────┘
-   └───────┬──────┘   └────────┬───────┘         │
-           │                   │                  │
-           └───────────────────┴──────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  EmotionFusionAgent  │
-                    │  (agent_logic.py)   │
-                    │  Claude Sonnet 4.6  │
-                    │                     │
-                    │  Règles d'arbitrage:│
-                    │  BPM>100 + neutre   │
-                    │  → anxiété latente  │
-                    │  Faible lumière     │
-                    │  → texte 70%,       │
-                    │    BPM 30%          │
-                    └──────────┬──────────┘
-                               │ JSON XAI structuré
-                               ▼
-          ┌────────────────────────────────────────┐
-          │           Multi-Platform Discovery      │
-          ├─────────────┬───────────┬──────────────┤
-          │  Spotify    │  Last.fm  │  YouTube +   │
-          │  (Premium)  │  (Gratuit)│  Apple Music │
-          └─────────────┴───────────┴──────────────┘
-```
+![Architecture V3](assets/architecture.svg)
 
----
+```mermaid
+flowchart TD
+    subgraph INPUT["Couche d'Entrée"]
+        V["Vision\nDeepFace · VGG-Face\n7 classes → 4 émotions"]
+        T["Texte NLP\nHuggingFace · French\nAnalyse sémantique"]
+        B["Physiologie\nBPM — Rythme cardiaque\nRéel ou simulé"]
+    end
 
-## Protocole de Fusion Trimode
+    subgraph AGENT["Agent de Fusion — Claude Sonnet 4.6"]
+        A["EmotionFusionAgent\nagent_logic.py"]
+        R1["Règle 1: BPM>100 + neutre → Anxiété latente"]
+        R2["Règle 2: Faible luminosité → Texte 70%, BPM 30%"]
+        R3["Règle 3: Texte ≠ Visage → Sarcasme / masquage"]
+        FB["Fallback V1 si API indisponible"]
+    end
 
-L'agent LLM arbitre entre trois signaux pour générer l'état affectif unifié :
+    subgraph OUT["Découverte Musicale"]
+        S["Spotify\nPremium API"]
+        L["Last.fm\nGratuit · Tags"]
+        Y["YouTube\nData API v3"]
+        AM["Apple Music\niTunes embed"]
+    end
 
-1. **Vision (VGG-Face)** — Probabilités brutes des expressions faciales (7 classes → 4)
-2. **Texte (NLP)** — Analyse sémantique et tonale du chat en français
-3. **Physiologie (BPM)** — Rythme cardiaque réel ou simulé
-
-**Règles d'arbitrage :**
-- Si BPM > 100 mais visage neutre → suspecter anxiété latente ou stress physique
-- Si luminosité caméra faible → poids Texte = 70%, BPM = 30%, Vision = 0%
-- Si divergence texte/visage > seuil → détecter sarcasme ou masquage émotionnel
-- Fallback V1 heuristique si l'API Claude est indisponible
-
-**Format de sortie JSON de l'agent :**
-```json
-{
-  "emotion_unifiee": "anxiété",
-  "bpm_analysis": "BPM élevé (115) contredisant expression neutre",
-  "analyse_cognitive_interne": "Signal physiologique dominant — stress somatique probable",
-  "message_utilisateur": "Votre rythme cardiaque suggère un besoin de calme...",
-  "confidence_score": 0.82,
-  "music_params": {
-    "target_valence": 0.3,
-    "target_energy": 0.2,
-    "suggested_artists": ["Nils Frahm", "Ólafur Arnalds"],
-    "suggested_genres": ["ambient", "piano", "classical"]
-  }
-}
+    V --> A
+    T --> A
+    B --> A
+    A --> R1
+    A --> R2
+    A --> R3
+    A --> FB
+    A -->|JSON XAI| S
+    A -->|JSON XAI| L
+    A -->|JSON XAI| Y
+    A -->|JSON XAI| AM
 ```
 
 ---
 
-## Classes Émotionnelles & Paramètres Musicaux
+## Protocole de Fusion Trimodale
 
-| Émotion  | Valence | Énergie | Tempo  | Genres suggérés        |
-|----------|---------|---------|--------|------------------------|
-| Heureux  | Élevée  | Élevée  | Rapide | pop, dance, funk       |
-| Triste   | Faible  | Faible  | Lent   | acoustic, piano, indie |
-| Anxieux  | Faible  | Moyenne | Varié  | ambient, classical     |
-| En colère| Faible  | Élevée  | Rapide | metal, rock, hip-hop   |
-| Neutre   | Moyenne | Moyenne | Moyen  | ambient, chill, lo-fi  |
+![Fusion Flow](assets/fusion_flow.svg)
 
----
+```mermaid
+flowchart LR
+    subgraph SIGNALS["Signaux d'entrée"]
+        V["Vision\nw = 40–60%"]
+        T["Texte\nw = 40–70%"]
+        P["BPM\nw = 10–30%"]
+    end
 
-## Intégrations Musicales
+    subgraph RULES["Règles d'arbitrage"]
+        R1{{"BPM > 100 + neutre?"}}
+        R2{{"Faible luminosité?"}}
+        R3{{"Texte ≠ Visage?"}}
+    end
 
-### Spotify (Premium requis)
-- Recommandations par artistes seeds, genres, et paramètres audio
-- 5+ stratégies de fallback en cascade
+    subgraph OUTPUT["Sortie XAI"]
+        E["emotion_unifiee"]
+        M["message_utilisateur\n(empathique, FR)"]
+        X["analyse_cognitive_interne\n(XAI technique)"]
+        MP["music_params\n(valence · energy · artists · genres)"]
+    end
 
-### Last.fm (Gratuit — nouveau en V3)
-- Alternative sans quota Spotify Premium
-- Mapping émotion → tags Last.fm
-- Recommandations personnalisées via historique d'écoute
-
-### YouTube (optionnel — nouveau en V3)
-- YouTube Data API v3
-- Vidéos intégrables avec thumbnails
-- Fallback gracieux si quota épuisé
-
-### Apple Music via iTunes (nouveau en V3)
-- URLs d'embed Apple Music sans authentification
-- Enrichissement des pistes Last.fm
+    V --> R1
+    P --> R1
+    V --> R2
+    T --> R2
+    P --> R2
+    V --> R3
+    T --> R3
+    R1 -->|Oui → anxiété| E
+    R2 -->|Oui → ignorer vision| E
+    R3 -->|Oui → sarcasme| E
+    E --> M
+    E --> X
+    E --> MP
+```
 
 ---
 
 ## Stack Technique
+
+```mermaid
+graph LR
+    UI["Streamlit\nChat Interface"] --> AG["Claude Sonnet 4.6\nEmotionFusionAgent"]
+    AG --> SP["Spotify\nspotipy"]
+    AG --> LF["Last.fm\npylast"]
+    AG --> YT["YouTube\nData API v3"]
+    AG --> AM["Apple Music\niTunes API"]
+
+    subgraph DETECT["Détection Multimodale"]
+        CAM["OpenCV\nWebcam"] --> DF["DeepFace\nVGG-Face"]
+        CHAT["Chat FR"] --> NLP["HuggingFace\nTransformers"]
+        BPM["BPM Input"]
+    end
+
+    DETECT --> AG
+```
 
 | Couche | Technologie |
 |---|---|
@@ -159,6 +152,18 @@ L'agent LLM arbitre entre trois signaux pour générer l'état affectif unifié 
 
 ---
 
+## Classes Émotionnelles & Paramètres Musicaux
+
+| Émotion | Valence | Énergie | Tempo | Genres suggérés |
+|---------|---------|---------|-------|-----------------|
+| Heureux | Élevée | Élevée | Rapide | pop, dance, funk |
+| Triste | Faible | Faible | Lent | acoustic, piano, indie |
+| Anxieux | Faible | Moyenne | Varié | ambient, classical |
+| En colère | Faible | Élevée | Rapide | metal, rock, hip-hop |
+| Neutre | Moyenne | Moyenne | Moyen | ambient, chill, lo-fi |
+
+---
+
 ## Installation
 
 ### Prérequis
@@ -168,9 +173,9 @@ L'agent LLM arbitre entre trois signaux pour générer l'état affectif unifié 
 - Clé API [Last.fm](https://www.last.fm/api/account/create) (gratuite, recommandée)
 - Clé API [YouTube Data v3](https://console.cloud.google.com/) (optionnelle)
 
-### 1. Cloner le dépôt
+### 1. Cloner le dépôt (branche v3)
 ```bash
-git clone https://github.com/<your-username>/face2melody.git
+git clone -b v3 https://github.com/dagh22/face2melody.git
 cd face2melody
 ```
 
@@ -239,29 +244,20 @@ face2melody/
 ├── analytics_gen.py                # Dashboard analytique recherche
 ├── test_v1_vs_v2.py                # Suite de validation V1 vs V2 vs V3
 ├── requirements.txt
+├── assets/
+│   ├── banner.svg                  # Bannière du projet
+│   ├── architecture.svg            # Diagramme d'architecture
+│   └── fusion_flow.svg             # Flux de fusion trimodale
 ├── recommender/
 │   ├── emotion_detector.py         # Wrapper DeepFace (lazy init, thread-safe)
 │   ├── spotify_interface.py        # Client Spotify OAuth + recommandations
-│   ├── lastfm_interface.py         # Client Last.fm (nouveau V3)
-│   ├── youtube_search.py           # Recherche YouTube Data API (nouveau V3)
-│   ├── itunes_search.py            # Embed Apple Music via iTunes (nouveau V3)
+│   ├── lastfm_interface.py         # Client Last.fm (V3)
+│   ├── youtube_search.py           # YouTube Data API (V3)
+│   ├── itunes_search.py            # Apple Music via iTunes (V3)
 │   └── playlist_generator.py      # Génération de playlists en lot
 ├── archive/                        # Pages Streamlit dépréciées (référence)
 └── logs/                           # Logs JSONL participants (gitignored)
 ```
-
----
-
-## Suite de Tests
-
-`test_v1_vs_v2.py` contient 5 cas de test couvrant :
-- Congruence émotionnelle (signaux alignés)
-- Dissonance (signaux contradictoires)
-- Détection de sarcasme
-- Signaux faibles / ambigus
-- Neutralité
-
-Génère un rapport de comparaison dans `logs/v1_vs_v2_comparison.json`.
 
 ---
 
@@ -271,13 +267,9 @@ Les logs de participants sont stockés localement dans `logs/` et exclus du cont
 
 ---
 
-## Auteur
+<div align="center">
 
-**Daghsen** — Projet de Recherche M.Sc. Intelligence Artificielle  
-Informatique Cognitive / Affective Computing — UQAM
+**Daghsen** — Projet de Recherche M.Sc. Intelligence Artificielle · UQAM  
+*Informatique Cognitive / Affective Computing*
 
----
-
-## Licence
-
-Ce projet est publié à des fins académiques et de recherche. Voir [LICENSE](LICENSE) pour les détails.
+</div>

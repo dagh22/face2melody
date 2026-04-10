@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500" width="900" height="500">
+  <defs>
+    <linearGradient id="bg3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1117"/>
+      <stop offset="100%" style="stop-color:#161b22"/>
+    </linearGradient>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#6b7280"/>
+    </marker>
+    <marker id="arr_gold" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97706"/>
+    </marker>
+    <marker id="arr_red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arr_blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr_purple" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arr_green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="500" fill="url(#bg3)" rx="12"/>
+  <rect width="900" height="500" fill="none" stroke="#30363d" stroke-width="1" rx="12"/>
+
+  <!-- Title -->
+  <text x="450" y="36" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="16" font-weight="700" fill="#e6edf3">Protocole de Fusion Trimodale — Règles d'Arbitrage</text>
+
+  <!-- ===== INPUT SIGNALS ===== -->
+
+  <!-- Camera / Vision -->
+  <rect x="30" y="65" width="150" height="70" rx="8" fill="#7c3aed" fill-opacity="0.2" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="105" y="92" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="12" font-weight="700" fill="#a78bfa">Webcam</text>
+  <text x="105" y="108" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#8b949e">Luminosité OK</text>
+  <text x="105" y="124" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#a78bfa">w = 40–60%</text>
+
+  <!-- Camera low light -->
+  <rect x="30" y="155" width="150" height="70" rx="8" fill="#dc2626" fill-opacity="0.15" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="105" y="182" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="12" font-weight="700" fill="#f87171">Webcam</text>
+  <text x="105" y="198" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#8b949e">Faible luminosité</text>
+  <text x="105" y="214" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#f87171">w = 0% (ignoré)</text>
+
+  <!-- Text NLP -->
+  <rect x="30" y="250" width="150" height="70" rx="8" fill="#2563eb" fill-opacity="0.2" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="105" y="277" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="12" font-weight="700" fill="#60a5fa">Texte NLP</text>
+  <text x="105" y="293" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#8b949e">Analyse chat FR</text>
+  <text x="105" y="309" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#60a5fa">w = 40–70%</text>
+
+  <!-- BPM -->
+  <rect x="30" y="345" width="150" height="70" rx="8" fill="#dc2626" fill-opacity="0.2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="105" y="372" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="12" font-weight="700" fill="#f87171">BPM</text>
+  <text x="105" y="388" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#8b949e">Rythme cardiaque</text>
+  <text x="105" y="404" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#f87171">w = 10–30%</text>
+
+  <!-- Arrows to arbitrage rules -->
+  <line x1="180" y1="100" x2="290" y2="140" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arr_purple)"/>
+  <line x1="180" y1="190" x2="290" y2="210" stroke="#dc2626" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr_red)"/>
+  <line x1="180" y1="285" x2="290" y2="270" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arr_blue)"/>
+  <line x1="180" y1="380" x2="290" y2="340" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr_red)"/>
+
+  <!-- ===== ARBITRAGE RULES ===== -->
+  <rect x="290" y="80" width="240" height="330" rx="10" fill="#d97706" fill-opacity="0.08" stroke="#d97706" stroke-width="1.5"/>
+  <text x="410" y="108" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="13" font-weight="700" fill="#fbbf24">Règles d'Arbitrage</text>
+  <text x="410" y="124" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#d97706">EmotionFusionAgent · Claude Sonnet 4.6</text>
+  <line x1="308" y1="132" x2="512" y2="132" stroke="#d97706" stroke-width="0.5" opacity="0.5"/>
+
+  <!-- Rule 1 -->
+  <rect x="306" y="142" width="208" height="58" rx="6" fill="#d97706" fill-opacity="0.12" stroke="#d97706" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="410" y="160" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" font-weight="700" fill="#fbbf24">Règle 1 — Stress Latent</text>
+  <text x="410" y="176" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#8b949e">SI BPM &gt; 100 ET visage = neutre</text>
+  <text x="410" y="191" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#f87171">→ Suspecter anxiété latente</text>
+
+  <!-- Rule 2 -->
+  <rect x="306" y="210" width="208" height="58" rx="6" fill="#d97706" fill-opacity="0.12" stroke="#d97706" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="410" y="228" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" font-weight="700" fill="#fbbf24">Règle 2 — Faible Luminosité</text>
+  <text x="410" y="244" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#8b949e">SI qualité caméra = faible</text>
+  <text x="410" y="259" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#60a5fa">→ Texte 70% · BPM 30%</text>
+
+  <!-- Rule 3 -->
+  <rect x="306" y="278" width="208" height="58" rx="6" fill="#d97706" fill-opacity="0.12" stroke="#d97706" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="410" y="296" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" font-weight="700" fill="#fbbf24">Règle 3 — Dissonance</text>
+  <text x="410" y="312" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#8b949e">SI texte ≠ visage &gt; seuil</text>
+  <text x="410" y="327" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#a78bfa">→ Détecter sarcasme/masquage</text>
+
+  <!-- Rule 4 -->
+  <rect x="306" y="346" width="208" height="52" rx="6" fill="#059669" fill-opacity="0.1" stroke="#059669" stroke-width="0.8" stroke-opacity="0.5"/>
+  <text x="410" y="364" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" font-weight="700" fill="#34d399">Fallback V1</text>
+  <text x="410" y="380" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#8b949e">SI Claude API indisponible</text>
+  <text x="410" y="393" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="9" fill="#34d399">→ Heuristiques V1 pondérées</text>
+
+  <!-- Arrow to output -->
+  <line x1="530" y1="245" x2="590" y2="245" stroke="#d97706" stroke-width="2" marker-end="url(#arr_gold)"/>
+
+  <!-- ===== OUTPUT ===== -->
+  <rect x="590" y="80" width="280" height="330" rx="10" fill="#059669" fill-opacity="0.08" stroke="#059669" stroke-width="1.5"/>
+  <text x="730" y="108" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="13" font-weight="700" fill="#34d399">Sortie JSON XAI</text>
+  <line x1="608" y1="118" x2="852" y2="118" stroke="#059669" stroke-width="0.5" opacity="0.5"/>
+
+  <!-- JSON fields -->
+  <text x="608" y="140" font-family="'Courier New', monospace" font-size="10" fill="#6e7681">{</text>
+  <text x="622" y="158" font-family="'Courier New', monospace" font-size="10" fill="#a78bfa">"emotion_unifiee"</text>
+  <text x="750" y="158" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">: string,</text>
+  <text x="622" y="176" font-family="'Courier New', monospace" font-size="10" fill="#f87171">"bpm_analysis"</text>
+  <text x="726" y="176" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">: string,</text>
+  <text x="622" y="194" font-family="'Courier New', monospace" font-size="10" fill="#fbbf24">"analyse_cognitive"</text>
+  <text x="622" y="210" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">   _interne: string,</text>
+  <text x="622" y="228" font-family="'Courier New', monospace" font-size="10" fill="#60a5fa">"message_utilisateur"</text>
+  <text x="622" y="244" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">   : string (FR),</text>
+  <text x="622" y="262" font-family="'Courier New', monospace" font-size="10" fill="#34d399">"confidence_score"</text>
+  <text x="748" y="262" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">: float,</text>
+  <text x="622" y="280" font-family="'Courier New', monospace" font-size="10" fill="#34d399">"music_params"</text>
+  <text x="720" y="280" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">: {</text>
+  <text x="636" y="298" font-family="'Courier New', monospace" font-size="9" fill="#8b949e">target_valence: float,</text>
+  <text x="636" y="314" font-family="'Courier New', monospace" font-size="9" fill="#8b949e">target_energy: float,</text>
+  <text x="636" y="330" font-family="'Courier New', monospace" font-size="9" fill="#8b949e">suggested_artists: [],</text>
+  <text x="636" y="346" font-family="'Courier New', monospace" font-size="9" fill="#8b949e">suggested_genres: []</text>
+  <text x="622" y="362" font-family="'Courier New', monospace" font-size="10" fill="#8b949e">  }</text>
+  <text x="608" y="378" font-family="'Courier New', monospace" font-size="10" fill="#6e7681">}</text>
+
+  <!-- Bottom label -->
+  <text x="450" y="480" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-size="10" fill="#484f58">Face2Melody V3 · M.Sc. Intelligence Artificielle · UQAM</text>
+</svg>
